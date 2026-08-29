@@ -19,5 +19,5 @@ the AI engine, the HTTP API, and the frontend belong to later slices.
 Reference: docs/PROSHIELD_PROJECT_UNDERSTANDING.md
 """
 
-__version__ = "4.6.0"
-__phase__ = "4.6"
+__version__ = "4.7.0"
+__phase__ = "4.7"
