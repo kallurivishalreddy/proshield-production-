@@ -1,0 +1,119 @@
+# ProShield — Phase 4.1
+
+Phase 4.1 establishes the **SecurityEvent ingestion and persistence
+foundation** only: canonical event model, validation, idempotent
+MongoDB persistence, repository boundary, the connector boundary
+(with a working `SimulatedConnector`), and the in-process ingestion
+service.
+
+The detection engine, rule registry, correlation, timeline, severity,
+confidence, incident, report, routing, AI, and HTTP API are **not**
+part of this slice (see `docs/PROSHIELD_PROJECT_UNDERSTANDING.md`
+Section 18 for the locked vs provisional vs open split).
+
+## Prerequisites
+
+* Python 3.13 (the self-contained UUIDv7 generator in this slice
+  follows RFC 9562 §5.7; if you change Python version, verify it
+  against `tests/unit/test_uuid7.py`).
+* MongoDB 6+ running on `127.0.0.1:27017`, no auth, with the
+  ability to create databases. The default test database is
+  `proshield`; integration tests use a per-session `proshield_test`
+  database.
+
+## Install
+
+```text
+pip install -r requirements.txt
+```
+
+## Bootstrap the database (idempotent)
+
+```text
+python -m scripts.init_mongo
+```
+
+This creates the `proshield` database, the `security_events`
+collection, applies the `$jsonSchema` validator, and creates the
+documented indexes (`ev_event_id_unique`, `ev_time_desc`,
+`ev_source_time`, `ev_type_time`, `ev_asset_time`, `ev_account_time`,
+`ev_provenance_source_id`).
+
+## Run the live smoke
+
+```text
+python -m scripts.live_smoke
+```
+
+This drops and recreates the collection, ingests 5 simulated
+events, then exercises the idempotent-replay path, the conflict
+path, the provenance lookup, and every documented index.
+
+## Run the test suite
+
+```text
+python -m pytest           # everything (requires MongoDB)
+python -m pytest tests/unit  # no infrastructure needed
+```
+
+Current results on this machine: **79 passed in 4.98s** (61 unit
++ 18 integration, against real local MongoDB).
+
+## Architecture map
+
+```
+app/
+  config.py                        runtime config from env
+  observability/logging.py         structured JSON logger (no secrets)
+  domain/
+    uuid7.py                       RFC 9562 UUIDv7 generator
+    security_event.py              canonical SecurityEvent model
+    errors.py                      safe-error envelope
+  connectors/
+    base.py                        connector interface
+    simulated.py                   SimulatedConnector
+  ingestion/
+    service.py                     the documented trust boundary
+  persistence/
+    mongo.py                       connection management
+    schema.py                      $jsonSchema validator
+    security_event_repository.py   the documented repository boundary
+scripts/
+  init_mongo.py                    bootstrap
+  live_smoke.py                    end-to-end runtime verification
+tests/
+  unit/                            no infrastructure needed
+  integration/                     real MongoDB on 127.0.0.1:27017
+```
+
+## What is NOT in this slice
+
+Anything in `docs/PROSHIELD_PROJECT_UNDERSTANDING.md` Section 18
+marked as "later slice" — including but not limited to:
+
+* detection rules, rule registry, candidate/approved governance,
+* source-specific detection engine (WAF, NGINX, IAM, rate-limiter),
+* correlation engine, timeline engine, severity engine, confidence
+  engine, incident engine, report engine, routing engine,
+* audit-event persistence (the schema is defined; the collection
+  and writer land in a later slice),
+* authentication, RBAC, object-level authorization enforcement
+  (the data model carries the necessary fields, but no enforcement
+  exists yet — Phase 4.1 is intentionally pre-auth),
+* HTTP API (the FastAPI dependency is installed for future slices
+  but no routes are exposed),
+* AI, future ML dataset pipeline, adversarial test factory,
+* any production deployment / packaging / containerization.
+
+## Architectural decisions that are PROVISIONAL
+
+* Python + FastAPI + pymongo (could be swapped; nothing in the
+  contract depends on it),
+* in-process ingestion service (could be replaced by an HTTP
+  surface in Phase 4.2; the in-process boundary is the smallest
+  defensible choice for Phase 4.1),
+* exact physical index set is the documented MVP minimum; further
+  indexes are query-driven and ADR-043 PROVISIONAL.
+
+See `docs/PROSHIELD_PROJECT_UNDERSTANDING.md` Section 18 for the
+full list.

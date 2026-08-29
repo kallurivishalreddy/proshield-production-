@@ -1,0 +1,99 @@
+"""Runtime configuration loader.
+
+Configuration is loaded from environment variables (with sensible local
+defaults) and is treated as security-sensitive data
+(docs/PHASE 3/SECURITY_CONFIGURATION.md). We do NOT read secrets from
+files on disk in this slice; environment variables are sufficient and
+keep the deployment story minimal.
+
+No value is ever logged. No value is ever sent back through a public
+API. The configuration object exposes only safe-to-print summaries via
+:meth:`ProShieldConfig.safe_summary`.
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import List
+
+
+def _env(name: str, default: str) -> str:
+    val = os.environ.get(name)
+    return val if val is not None and val != "" else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"environment variable {name} must be an integer, got {raw!r}"
+        ) from exc
+
+
+@dataclass(frozen=True)
+class ProShieldConfig:
+    """Immutable runtime configuration."""
+
+    env_name: str = "development"
+    log_level: str = "INFO"
+
+    mongo_uri: str = "mongodb://127.0.0.1:27017"
+    mongo_db: str = "proshield"
+    mongo_collection_events: str = "security_events"
+
+    ingest_max_body_bytes: int = 16_384
+    ingest_max_details_bytes: int = 8_192
+    ingest_rate_limit_per_minute: int = 600
+
+    # Comma-separated "name:module.path:ClassName" entries.
+    connector_specs: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_env(cls) -> "ProShieldConfig":
+        connector_specs_raw = _env("PROSHIELD_CONNECTORS", "")
+        connector_specs = [
+            s.strip() for s in connector_specs_raw.split(",") if s.strip()
+        ]
+        return cls(
+            env_name=_env("PROSHIELD_ENV", "development"),
+            log_level=_env("PROSHIELD_LOG_LEVEL", "INFO"),
+            mongo_uri=_env("PROSHIELD_MONGO_URI", "mongodb://127.0.0.1:27017"),
+            mongo_db=_env("PROSHIELD_MONGO_DB", "proshield"),
+            mongo_collection_events=_env(
+                "PROSHIELD_MONGO_COLLECTION_EVENTS", "security_events"
+            ),
+            ingest_max_body_bytes=_env_int(
+                "PROSHIELD_INGEST_MAX_BODY_BYTES", 16_384
+            ),
+            ingest_max_details_bytes=_env_int(
+                "PROSHIELD_INGEST_MAX_DETAILS_BYTES", 8_192
+            ),
+            ingest_rate_limit_per_minute=_env_int(
+                "PROSHIELD_INGEST_RATE_LIMIT_PER_MINUTE", 600
+            ),
+            connector_specs=connector_specs,
+        )
+
+    def safe_summary(self) -> dict:
+        """Redacted view suitable for diagnostics. Never includes secrets."""
+        # Note: mongo_uri may carry credentials. We strip them defensively.
+        uri = self.mongo_uri
+        if "@" in uri:
+            scheme, _, rest = uri.partition("://")
+            _, _, hostpart = rest.partition("@")
+            uri = f"{scheme}://***@{hostpart}"
+        return {
+            "env": self.env_name,
+            "log_level": self.log_level,
+            "mongo_uri": uri,
+            "mongo_db": self.mongo_db,
+            "mongo_collection_events": self.mongo_collection_events,
+            "ingest_max_body_bytes": self.ingest_max_body_bytes,
+            "ingest_max_details_bytes": self.ingest_max_details_bytes,
+            "ingest_rate_limit_per_minute": self.ingest_rate_limit_per_minute,
+            "connectors": self.connector_specs,
+        }

@@ -1,0 +1,54 @@
+# ProShield Phase 4.1
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# venv
+.venv/
+venv/
+env/
+
+# local config / secrets
+.env
+.env.*
+!.env.example
+
+# editor / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# OS / misc
+Thumbs.db
+
+# logs
+*.log
+logs/
+
+# build / dist
+build/
+dist/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# ad-hoc scratch / test output (project-local)
+/collect.txt
+/investigate_results.txt
+/t2.txt
+/test_output.txt
+/test_rev.txt
+/test_review.txt
+/test_review2.txt
+/valid.txt
+
