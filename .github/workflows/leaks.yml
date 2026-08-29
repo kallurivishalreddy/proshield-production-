@@ -1,0 +1,50 @@
+name: Leaks
+
+# Trigger on the same events as the test workflow so that secret
+# detection runs on every change that reaches main (push) and on every
+# change proposed to main (pull_request).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least-privilege permissions. The action needs read access to the
+# repository contents to scan them. The default GITHUB_TOKEN (which
+# inherits from these permissions) is used by the action to upload
+# the SARIF artifact and post the job summary; no other scopes are
+# requested. No paid GitHub Advanced Security is required: the SARIF
+# is delivered as a workflow artifact that any repo collaborator
+# can download, independent of the GHAS "Code scanning" UI.
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 is the gitleaks-action recommendation: it
+          # gives the scanner the full git history so that a secret
+          # which was committed and later removed in a follow-up
+          # commit is still caught.
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          # Pin the scanner to a specific, current Gitleaks release
+          # for deterministic builds. The latest stable as of this
+          # commit is 8.30.1 (https://github.com/gitleaks/gitleaks/releases).
+          # The action accepts the version with no 'v' prefix.
+          GITLEAKS_VERSION: '8.30.1'
+          # GITLEAKS_LICENSE is intentionally NOT set: this repository
+          # is owned by a personal GitHub account, and a free license
+          # key is only required for organization-owned repositories
+          # (per the gitleaks-action README).
+          # The default GITHUB_TOKEN is forwarded so the action can
+          # upload the SARIF artifact and post the job summary.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
