@@ -49,6 +49,27 @@ class ProShieldConfig:
     ingest_max_details_bytes: int = 8_192
     ingest_rate_limit_per_minute: int = 600
 
+    # Phase 4.8: auth / proxy / routing configuration.
+    # The signing key MUST be supplied through a secure
+    # mechanism (env-var injection). The Phase 4.8 slice
+    # defaults to an empty string so a misconfigured
+    # production startup fails fast (see Phase 3 secret
+    # validation rules); tests inject a deterministic key.
+    auth_signing_key: str = ""
+    auth_token_lifetime_seconds: int = 3600
+    # Proxy rate-limit / abuse-protection knobs. The proxy
+    # uses ``proxy_rate_limit_per_minute`` as the per-subject
+    # budget; ``proxy_max_request_bytes`` caps the wire body
+    # size of any client request; ``proxy_max_response_bytes``
+    # caps the largest response the proxy will emit (so a
+    # pathological analyst-side dump cannot exhaust memory).
+    proxy_rate_limit_per_minute: int = 120
+    proxy_max_request_bytes: int = 32_768
+    proxy_max_response_bytes: int = 1_048_576  # 1 MiB
+    # Centralized-analysis rate-limit: a tighter budget
+    # because centralized correlation is expensive.
+    proxy_centralized_rate_limit_per_minute: int = 5
+
     # Comma-separated "name:module.path:ClassName" entries.
     connector_specs: List[str] = field(default_factory=list)
 
@@ -75,6 +96,22 @@ class ProShieldConfig:
             ingest_rate_limit_per_minute=_env_int(
                 "PROSHIELD_INGEST_RATE_LIMIT_PER_MINUTE", 600
             ),
+            auth_signing_key=_env("PROSHIELD_AUTH_SIGNING_KEY", ""),
+            auth_token_lifetime_seconds=_env_int(
+                "PROSHIELD_AUTH_TOKEN_LIFETIME_SECONDS", 3600
+            ),
+            proxy_rate_limit_per_minute=_env_int(
+                "PROSHIELD_PROXY_RATE_LIMIT_PER_MINUTE", 120
+            ),
+            proxy_max_request_bytes=_env_int(
+                "PROSHIELD_PROXY_MAX_REQUEST_BYTES", 32_768
+            ),
+            proxy_max_response_bytes=_env_int(
+                "PROSHIELD_PROXY_MAX_RESPONSE_BYTES", 1_048_576
+            ),
+            proxy_centralized_rate_limit_per_minute=_env_int(
+                "PROSHIELD_PROXY_CENTRALIZED_RATE_LIMIT_PER_MINUTE", 5
+            ),
             connector_specs=connector_specs,
         )
 
@@ -95,5 +132,12 @@ class ProShieldConfig:
             "ingest_max_body_bytes": self.ingest_max_body_bytes,
             "ingest_max_details_bytes": self.ingest_max_details_bytes,
             "ingest_rate_limit_per_minute": self.ingest_rate_limit_per_minute,
+            "auth_signing_key_set": bool(self.auth_signing_key),
+            "auth_token_lifetime_seconds": self.auth_token_lifetime_seconds,
+            "proxy_rate_limit_per_minute": self.proxy_rate_limit_per_minute,
+            "proxy_max_request_bytes": self.proxy_max_request_bytes,
+            "proxy_max_response_bytes": self.proxy_max_response_bytes,
+            "proxy_centralized_rate_limit_per_minute":
+                self.proxy_centralized_rate_limit_per_minute,
             "connectors": self.connector_specs,
         }

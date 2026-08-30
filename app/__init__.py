@@ -10,14 +10,18 @@ per-event production rules for the NGINX connector. Phase 4.5 adds
 detection persistence, ingestion->detection wiring, the cross-event
 correlation engine (``app/correlation/``), and correlation persistence.
 Phase 4.6 adds the attack-timeline engine (``app/timeline/``) and the
-severity / confidence engine (``app/severity/``).
+severity / confidence engine (``app/severity/``). Phase 4.7 adds the
+generic rule management backend (``app/rules/management/``).
+Phase 4.8 adds the analyst-investigation backend: incident / case
+(``app/incidents/``), reports (``app/reports/``), routing
+(``app/routing/``), the minimal auth foundation (``app/auth/``),
+and the secure application proxy / gateway (``app/proxy/``).
 
-Incident creation, early incident reports, analyst routing, escalation
-workflows, queue assignment, the report generator, the audit subsystem,
-the AI engine, the HTTP API, and the frontend belong to later slices.
+Analyst queue / escalation / advanced severity-aware routing /
+future IAM are explicit future scope.
 
 Reference: docs/PROSHIELD_PROJECT_UNDERSTANDING.md
 """
 
-__version__ = "4.7.0"
-__phase__ = "4.7"
+__version__ = "4.8.0"
+__phase__ = "4.8"

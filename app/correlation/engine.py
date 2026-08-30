@@ -247,6 +247,64 @@ class CorrelationEngine:
             produced_at=now,
         )
 
+    def run_centralized(
+        self,
+        detections: Sequence[Detection],
+        events: Mapping[str, SecurityEvent],
+        *,
+        existing_correlation_ids: Optional[Sequence[str]] = None,
+        now: Optional[datetime] = None,
+    ) -> "CentralizedCorrelationResult":
+        """Run the correlation engine on the analyst-supplied
+        wider evidence catalogue (the Phase 4.8 centralized
+        analysis extension).
+
+        This is the **smallest** approved interface the
+        Phase 4.8 incident service needs to drive a
+        centralized analysis: it reuses the exact same
+        pattern catalogue as :meth:`run`; it does NOT
+        introduce a second engine.
+
+        The result additionally carries:
+
+        * ``existing_correlation_ids`` - the correlation
+          ids already in the case, so the incident
+          service can compute the *new* correlation ids
+          without re-walking the correlation catalogue;
+        * a guarantee that the returned
+          ``new_correlations`` excludes the existing ids
+          (so adding them to the case is a true union, not
+          a duplicate).
+
+        Failure semantics match :meth:`run`: the engine
+        never raises a bare :class:`Exception` for normal
+        input flow; pattern-level failures are quarantined
+        to ``errors``.
+        """
+        from .models import CentralizedCorrelationResult
+        base = self.run(detections=detections, events=events, now=now)
+        existing = set(existing_correlation_ids or ())
+        new: List[Correlation] = [
+            c for c in base.correlations if c.correlation_id not in existing
+        ]
+        combined: List[Correlation] = []
+        seen: set = set()
+        for c in base.correlations:
+            if c.correlation_id in seen:
+                continue
+            seen.add(c.correlation_id)
+            combined.append(c)
+        return CentralizedCorrelationResult(
+            correlations=tuple(combined),
+            new_correlations=tuple(new),
+            patterns_considered=base.patterns_considered,
+            patterns_evaluated=base.patterns_evaluated,
+            detections_consumed=base.detections_consumed,
+            errors=base.errors,
+            produced_at=base.produced_at,
+            existing_correlation_ids=frozenset(existing),
+        )
+
 
 def _truncate(s: str, n: int) -> str:
     if not isinstance(s, str):

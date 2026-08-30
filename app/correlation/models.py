@@ -60,7 +60,7 @@ What this module does NOT do
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any, Dict, Tuple
+from typing import Annotated, Any, Dict, FrozenSet, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
@@ -75,9 +75,73 @@ __all__ = [
     "CorrelationKey",
     "CorrelationResult",
     "CorrelationTrigger",
+    "CentralizedCorrelationResult",
     "EventId",
     "MAX_CORRELATION_REASONING_LEN",
 ]
+
+
+# ----------------------------------------------------------------- centralized
+class CentralizedCorrelationResult(BaseModel):
+    """The Phase 4.8 centralized-analysis result.
+
+    A :class:`CentralizedCorrelationResult` is what
+    :meth:`CorrelationEngine.run_centralized` returns.
+    It is a thin extension of :class:`CorrelationResult`
+    carrying:
+
+    * ``new_correlations`` - the correlations produced by
+      the engine that are NOT in
+      ``existing_correlation_ids``. The incident service
+      uses this set to build the case's centralized
+      context without walking the existing catalogue.
+    * ``existing_correlation_ids`` - the snapshot of the
+      ids the engine was told were already in the case;
+      the orchestrator can use this for diagnostics.
+
+    The ``correlations`` field is the union of the
+    existing + new correlations (deduped, original order
+    preserved).
+
+    A :class:`CentralizedCorrelationResult` is **frozen**
+    and a **fact** about one analyst-requested centralized
+    run.
+    """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+    correlations: Tuple[Correlation, ...] = ()
+    new_correlations: Tuple[Correlation, ...] = ()
+    patterns_considered: Annotated[
+        int, Field(ge=0, le=MAX_CORRELATION_RESULT_PATTERNS)
+    ] = 0
+    patterns_evaluated: Annotated[
+        int, Field(ge=0, le=MAX_CORRELATION_RESULT_PATTERNS)
+    ] = 0
+    detections_consumed: Annotated[int, Field(ge=0, le=10_000)] = 0
+    errors: Tuple[
+        Annotated[str, StringConstraints(min_length=1, max_length=1024)],
+        ...,
+    ] = ()
+    produced_at: datetime
+    existing_correlation_ids: FrozenSet[str] = frozenset()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "correlations": [c.to_dict() for c in self.correlations],
+            "new_correlations": [c.to_dict() for c in self.new_correlations],
+            "patterns_considered": self.patterns_considered,
+            "patterns_evaluated": self.patterns_evaluated,
+            "detections_consumed": self.detections_consumed,
+            "errors": list(self.errors),
+            "produced_at": self.produced_at.isoformat(),
+            "existing_correlation_ids": sorted(
+                self.existing_correlation_ids
+            ),
+        }
 
 
 # ----------------------------------------------------------------- id pattern
