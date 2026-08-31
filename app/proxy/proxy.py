@@ -58,6 +58,21 @@ OP_GENERATE_CENTRALIZED_REPORT = "report.generate_centralized"
 OP_ROUTE_CASE = "routing.compute"
 OP_AUTH_ISSUE = "auth.issue"
 
+# Phase 4.9: source-management wire operations (client-facing
+# boundary; the trusted-inbound boundary lives in
+# :mod:`app.sources.ingress` and is gated by source-identity
+# tokens, not session tokens).
+OP_SOURCE_LIST = "source.list"
+OP_SOURCE_GET = "source.get"
+OP_SOURCE_LIST_TYPES = "source.list_types"
+OP_SOURCE_REGISTER = "source.register"
+OP_SOURCE_CONFIGURE = "source.configure"
+OP_SOURCE_VALIDATE = "source.validate"
+OP_SOURCE_ENABLE = "source.enable"
+OP_SOURCE_DISABLE = "source.disable"
+OP_SOURCE_RETIRE = "source.retire"
+OP_SOURCE_ISSUE_TOKEN = "source.issue_token"
+
 ALLOWED_OPERATIONS: frozenset = frozenset({
     OP_HEALTH,
     OP_GET_CASE,
@@ -71,6 +86,16 @@ ALLOWED_OPERATIONS: frozenset = frozenset({
     OP_GENERATE_CENTRALIZED_REPORT,
     OP_ROUTE_CASE,
     OP_AUTH_ISSUE,
+    OP_SOURCE_LIST,
+    OP_SOURCE_GET,
+    OP_SOURCE_LIST_TYPES,
+    OP_SOURCE_REGISTER,
+    OP_SOURCE_CONFIGURE,
+    OP_SOURCE_VALIDATE,
+    OP_SOURCE_ENABLE,
+    OP_SOURCE_DISABLE,
+    OP_SOURCE_RETIRE,
+    OP_SOURCE_ISSUE_TOKEN,
 })
 
 MAX_PROXY_REQUEST_BYTES = 32_768
@@ -164,6 +189,7 @@ class SecureProxy:
         incident_service: Optional[IncidentService] = None,
         report_service: Optional[ReportService] = None,
         routing_engine: Optional[RoutingEngine] = None,
+        source_management_service: Optional[Any] = None,
     ) -> None:
         if not isinstance(config, ProShieldConfig):
             raise ValueError("config must be a ProShieldConfig")
@@ -184,6 +210,7 @@ class SecureProxy:
         self._incident_service = incident_service
         self._report_service = report_service
         self._routing_engine = routing_engine or RoutingEngine()
+        self._source_management_service = source_management_service
         self._rate_limiter = _RateLimiter(
             window_seconds=60,
             budget=int(config.proxy_rate_limit_per_minute),
@@ -229,6 +256,44 @@ class SecureProxy:
         if not isinstance(service, ReportService):
             raise ValueError("service must be a ReportService")
         self._report_service = service
+
+    def attach_source_management_service(self, service: Any) -> None:
+        """Attach the Phase 4.9 source-management service.
+
+        Accepts the duck-typed
+        :class:`app.sources.SourceManagementService` to avoid
+        a circular import (the proxy does not import
+        :mod:`app.sources`).
+        """
+        if service is None:
+            self._source_management_service = None
+            return
+        # We deliberately accept any object that exposes the
+        # documented public methods. Importing
+        # :class:`SourceManagementService` for ``isinstance``
+        # would couple the two packages at import time.
+        required = {
+            "list_all",
+            "get",
+            "register",
+            "configure",
+            "validate_connection",
+            "enable",
+            "disable",
+            "retire",
+            "issue_ingress_token",
+            "list_supported_connector_types",
+        }
+        missing = [
+            name for name in required
+            if not hasattr(service, name)
+        ]
+        if missing:
+            raise ValueError(
+                f"source management service is missing methods: "
+                f"{missing}"
+            )
+        self._source_management_service = service
 
     # ----- request dispatch
     def handle(self, request: ProxyRequest) -> ProxyResponse:
@@ -439,6 +504,26 @@ class SecureProxy:
             )
         if op == OP_ROUTE_CASE:
             return self._handle_route_case(request, identity)
+        if op == OP_SOURCE_LIST:
+            return self._handle_source_list(request, identity)
+        if op == OP_SOURCE_GET:
+            return self._handle_source_get(request, identity)
+        if op == OP_SOURCE_LIST_TYPES:
+            return self._handle_source_list_types(request, identity)
+        if op == OP_SOURCE_REGISTER:
+            return self._handle_source_register(request, identity)
+        if op == OP_SOURCE_CONFIGURE:
+            return self._handle_source_configure(request, identity)
+        if op == OP_SOURCE_VALIDATE:
+            return self._handle_source_validate(request, identity)
+        if op == OP_SOURCE_ENABLE:
+            return self._handle_source_enable(request, identity)
+        if op == OP_SOURCE_DISABLE:
+            return self._handle_source_disable(request, identity)
+        if op == OP_SOURCE_RETIRE:
+            return self._handle_source_retire(request, identity)
+        if op == OP_SOURCE_ISSUE_TOKEN:
+            return self._handle_source_issue_token(request, identity)
         raise InvalidProxyRequestError(
             safe_message="unknown operation",
             internal_detail=f"operation={op!r}",
@@ -772,6 +857,238 @@ class SecureProxy:
         )
         return self._shape_ok({"routing": result.to_dict()})
 
+    # --------------------------------------------------------------- source ops
+    def _require_source_service(self) -> Any:
+        svc = self._source_management_service
+        if svc is None:
+            raise InvalidProxyRequestError(
+                safe_message="source management service unavailable",
+                internal_detail="proxy not wired",
+            )
+        return svc
+
+    def _view_to_dict(self, view: Any) -> Dict[str, Any]:
+        if hasattr(view, "model_dump"):
+            # ``mode="json"`` stringifies datetimes so the
+            # response is wire-shape JSON-safe.
+            return view.model_dump(mode="json")
+        return dict(view)
+
+    def _handle_source_list(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.EVENT_READ)
+        svc = self._require_source_service()
+        views = svc.list_all()
+        return self._shape_ok({
+            "sources": [self._view_to_dict(v) for v in views],
+            "supported_connector_types": [
+                t.value for t in svc.list_supported_connector_types()
+            ],
+        })
+
+    def _handle_source_list_types(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.EVENT_READ)
+        svc = self._require_source_service()
+        return self._shape_ok({
+            "supported_connector_types": [
+                t.value for t in svc.list_supported_connector_types()
+            ],
+        })
+
+    def _handle_source_get(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.EVENT_READ)
+        body = request.body or {}
+        sid = body.get("source_instance_id")
+        if not isinstance(sid, str) or not sid:
+            raise InvalidProxyRequestError(
+                safe_message="source_instance_id required",
+                internal_detail="missing source_instance_id",
+                field="source_instance_id",
+            )
+        svc = self._require_source_service()
+        view = svc.get(sid)
+        return self._shape_ok({"source": self._view_to_dict(view)})
+
+    def _handle_source_register(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        body = request.body or {}
+        source_type_str = body.get("source_type")
+        display_name = body.get("display_name")
+        if not isinstance(source_type_str, str) or not source_type_str:
+            raise InvalidProxyRequestError(
+                safe_message="source_type required",
+                internal_detail="missing source_type",
+                field="source_type",
+            )
+        if not isinstance(display_name, str) or not display_name:
+            raise InvalidProxyRequestError(
+                safe_message="display_name required",
+                internal_detail="missing display_name",
+                field="display_name",
+            )
+        from ..sources.models import SourceType
+        try:
+            source_type = SourceType(source_type_str)
+        except ValueError as exc:
+            raise InvalidProxyRequestError(
+                safe_message="unknown source_type",
+                internal_detail=str(exc)[:256],
+                field="source_type",
+            )
+        svc = self._require_source_service()
+        view = svc.register(
+            identity=identity,
+            source_type=source_type,
+            display_name=display_name,
+            description=str(body.get("description", "")),
+            tags=tuple(body.get("tags") or ()),
+            asset_tags=tuple(body.get("asset_tags") or ()),
+        )
+        return self._shape_ok({"source": self._view_to_dict(view)})
+
+    def _handle_source_configure(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        body = request.body or {}
+        sid = body.get("source_instance_id")
+        cfg = body.get("configuration") or {}
+        if not isinstance(sid, str) or not sid:
+            raise InvalidProxyRequestError(
+                safe_message="source_instance_id required",
+                internal_detail="missing source_instance_id",
+                field="source_instance_id",
+            )
+        if not isinstance(cfg, dict):
+            raise InvalidProxyRequestError(
+                safe_message="configuration must be a dict",
+                internal_detail=f"got {type(cfg).__name__}",
+                field="configuration",
+            )
+        from ..sources.models import SourceConnectionType
+        conn_str = cfg.get("connection_type")
+        try:
+            connection_type = SourceConnectionType(conn_str)
+        except (ValueError, TypeError) as exc:
+            raise InvalidProxyRequestError(
+                safe_message="unknown connection_type",
+                internal_detail=str(exc)[:256],
+                field="connection_type",
+            )
+        from ..sources.models import SourceInstanceConfiguration
+        try:
+            configuration = SourceInstanceConfiguration(
+                connection_type=connection_type,
+                endpoint=str(cfg.get("endpoint", "")),
+                proxy_path=str(cfg.get("proxy_path", "")),
+                destination=str(cfg.get("destination", "")),
+                asset_tags=tuple(cfg.get("asset_tags") or ()),
+                tags=tuple(cfg.get("tags") or ()),
+                references=tuple(cfg.get("references") or ()),
+                secret_ref=str(cfg.get("secret_ref", "")),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise InvalidProxyRequestError(
+                safe_message="configuration validation failed",
+                internal_detail=str(exc)[:256],
+                field="configuration",
+            )
+        svc = self._require_source_service()
+        view = svc.configure(
+            identity=identity,
+            source_instance_id=sid,
+            configuration=configuration,
+        )
+        return self._shape_ok({"source": self._view_to_dict(view)})
+
+    def _handle_source_validate(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        body = request.body or {}
+        sid = body.get("source_instance_id")
+        if not isinstance(sid, str) or not sid:
+            raise InvalidProxyRequestError(
+                safe_message="source_instance_id required",
+                internal_detail="missing source_instance_id",
+                field="source_instance_id",
+            )
+        svc = self._require_source_service()
+        view = svc.validate_connection(
+            identity=identity,
+            source_instance_id=sid,
+        )
+        return self._shape_ok({"source": self._view_to_dict(view)})
+
+    def _handle_source_enable(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        body = request.body or {}
+        sid = body.get("source_instance_id")
+        if not isinstance(sid, str) or not sid:
+            raise InvalidProxyRequestError(
+                safe_message="source_instance_id required",
+                internal_detail="missing source_instance_id",
+                field="source_instance_id",
+            )
+        svc = self._require_source_service()
+        view = svc.enable(identity=identity, source_instance_id=sid)
+        return self._shape_ok({"source": self._view_to_dict(view)})
+
+    def _handle_source_disable(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        body = request.body or {}
+        sid = body.get("source_instance_id")
+        if not isinstance(sid, str) or not sid:
+            raise InvalidProxyRequestError(
+                safe_message="source_instance_id required",
+                internal_detail="missing source_instance_id",
+                field="source_instance_id",
+            )
+        svc = self._require_source_service()
+        view = svc.disable(identity=identity, source_instance_id=sid)
+        return self._shape_ok({"source": self._view_to_dict(view)})
+
+    def _handle_source_retire(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        body = request.body or {}
+        sid = body.get("source_instance_id")
+        if not isinstance(sid, str) or not sid:
+            raise InvalidProxyRequestError(
+                safe_message="source_instance_id required",
+                internal_detail="missing source_instance_id",
+                field="source_instance_id",
+            )
+        svc = self._require_source_service()
+        view = svc.retire(identity=identity, source_instance_id=sid)
+        return self._shape_ok({"source": self._view_to_dict(view)})
+
+    def _handle_source_issue_token(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        body = request.body or {}
+        sid = body.get("source_instance_id")
+        if not isinstance(sid, str) or not sid:
+            raise InvalidProxyRequestError(
+                safe_message="source_instance_id required",
+                internal_detail="missing source_instance_id",
+                field="source_instance_id",
+            )
+        svc = self._require_source_service()
+        packed = svc.issue_ingress_token(
+            identity=identity, source_instance_id=sid,
+        )
+        return self._shape_ok({
+            "source_instance_id": sid,
+            "source_token": packed,
+        })
+
 
 # ----------------------------------------------------------------- payload helpers
 def _payload_to_events(payload: Any) -> List[Any]:
@@ -981,6 +1298,16 @@ __all__ = [
     "OP_LIST_REPORTS",
     "OP_REQUEST_CENTRALIZED",
     "OP_ROUTE_CASE",
+    "OP_SOURCE_CONFIGURE",
+    "OP_SOURCE_DISABLE",
+    "OP_SOURCE_ENABLE",
+    "OP_SOURCE_GET",
+    "OP_SOURCE_ISSUE_TOKEN",
+    "OP_SOURCE_LIST",
+    "OP_SOURCE_LIST_TYPES",
+    "OP_SOURCE_REGISTER",
+    "OP_SOURCE_RETIRE",
+    "OP_SOURCE_VALIDATE",
     "PROXY_HEADER_AUTHORIZATION",
     "PROXY_HEADER_SESSION",
     "ProxyRequest",

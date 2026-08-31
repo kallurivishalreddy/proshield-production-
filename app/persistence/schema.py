@@ -100,6 +100,22 @@ SECURITY_EVENTS_VALIDATOR: Dict[str, Any] = {
                         "minLength": 1,
                         "maxLength": 256,
                     },
+                    # Phase 4.9: optional pointer to the
+                    # :class:`app.sources.SourceInstance` that
+                    # ingested the event. Set by the trusted
+                    # ingress boundary; absent for events
+                    # emitted by Phase 4.1-4.8 connectors
+                    # without source-management.
+                    "source_instance_id": {
+                        "bsonType": ["string", "null"],
+                        "minLength": 8,
+                        "maxLength": 96,
+                        "pattern": (
+                            r"^src-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
+                            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+                            r"(-[a-z0-9][a-z0-9-]{0,32})?$"
+                        ),
+                    },
                 },
             },
             "schema_version": {

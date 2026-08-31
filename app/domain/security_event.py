@@ -225,6 +225,14 @@ class SecurityEventProvenance(_StrictModel):
     source-side identifier so that evidence can always be traced.
 
     Reference: docs/PHASE 2/SECURITY_EVENT_SCHEMA.md, Section 8.
+
+    The optional ``source_instance_id`` was added in Phase 4.9
+    to carry the canonical reference to the
+    :class:`app.sources.SourceInstance` that ingested the
+    event. It is **optional** so Phase 4.1-4.8 documents /
+    fixtures (which construct provenance with only
+    ``collector`` + ``source_event_id``) keep working
+    unchanged.
     """
 
     collector: Annotated[
@@ -233,6 +241,20 @@ class SecurityEventProvenance(_StrictModel):
     source_event_id: Annotated[
         str, StringConstraints(min_length=1, max_length=MAX_PROVENANCE_SOURCE_EVENT_ID)
     ]
+    source_instance_id: Optional[
+        Annotated[
+            str,
+            StringConstraints(
+                min_length=8,
+                max_length=96,
+                pattern=(
+                    r"^src-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
+                    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+                    r"(-[a-z0-9][a-z0-9-]{0,32})?$"
+                ),
+            ),
+        ]
+    ] = None
 
 
 class SecurityEvent(_StrictModel):
@@ -355,6 +377,7 @@ class SecurityEvent(_StrictModel):
         cls, v: Dict[str, Any]
     ) -> Dict[str, Any]:
         _reject_sensitive_keys(v, path="details")
+        _reject_unsafe_bson_keys(v, path="details")
         return v
 
     @model_validator(mode="after")
@@ -399,6 +422,49 @@ def _reject_sensitive_keys(obj: Any, *, path: str) -> None:
     elif isinstance(obj, list):
         for i, item in enumerate(obj):
             _reject_sensitive_keys(item, path=f"{path}[{i}]")
+
+
+# S-3: MongoDB operator-key safety. Keys beginning with "$" or
+# containing "." must never reach the persistence layer; they would
+# allow external telemetry to inject query operators or reach into
+# sub-documents. Match is structural, not substring.
+_FORBIDDEN_BSON_KEY_CHARS = ("$", ".")
+_FORBIDDEN_BSON_KEY_PREFIX = "$"
+
+
+def _key_is_unsafe_for_bson(key: Any) -> bool:
+    if not isinstance(key, str):
+        return True  # non-string keys are unsafe (cannot be BSON field names)
+    if not key:
+        return True  # empty keys are unsafe
+    if key.startswith(_FORBIDDEN_BSON_KEY_PREFIX):
+        return True
+    for ch in _FORBIDDEN_BSON_KEY_CHARS:
+        if ch in key:
+            return True
+    return False
+
+
+def _reject_unsafe_bson_keys(obj: Any, *, path: str) -> None:
+    """S-3: reject MongoDB-operator / dotted-path keys at the boundary.
+
+    Walk a JSON-shaped object and raise if any key name would be
+    interpreted as a MongoDB query operator or as a path into a
+    sub-document. Applied to ``SecurityEvent.details`` (and to the
+    other JSON-shaped fields via ``model_validator``) so that
+    external telemetry cannot influence the persistence layer.
+    """
+    if isinstance(obj, dict):
+        for k, vv in obj.items():
+            if _key_is_unsafe_for_bson(k):
+                raise ValueError(
+                    f"{path}: forbidden BSON-unsafe key name {k!r} "
+                    "(leading '$' or containing '.' are not allowed)"
+                )
+            _reject_unsafe_bson_keys(vv, path=f"{path}.{k}")
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            _reject_unsafe_bson_keys(item, path=f"{path}[{i}]")
 
 
 def to_canonical_dict(event: SecurityEvent) -> Dict[str, Any]:

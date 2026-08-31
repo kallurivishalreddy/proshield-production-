@@ -70,6 +70,24 @@ class ProShieldConfig:
     # because centralized correlation is expensive.
     proxy_centralized_rate_limit_per_minute: int = 5
 
+    # Phase 4.9: source-management / ingress boundary knobs.
+    # ``source_signing_key`` is the HMAC key for the
+    # source-identity tokens that prove a source instance is
+    # trusted. ``source_token_lifetime_seconds`` bounds the
+    # window a token can be replayed. ``ingress_rate_limit_per_minute``
+    # is the per-source-instance budget for inbound
+    # telemetry so a malicious / misconfigured external
+    # system cannot flood the canonical pipeline. The
+    # ``ingress_max_request_bytes`` caps the wire-body size
+    # at the trusted inbound boundary so a single oversized
+    # payload cannot exhaust memory. ``ingress_max_response_bytes``
+    # caps the response size the boundary will emit.
+    source_signing_key: str = ""
+    source_token_lifetime_seconds: int = 3600
+    ingress_rate_limit_per_minute: int = 600
+    ingress_max_request_bytes: int = 32_768
+    ingress_max_response_bytes: int = 1_048_576  # 1 MiB
+
     # Comma-separated "name:module.path:ClassName" entries.
     connector_specs: List[str] = field(default_factory=list)
 
@@ -112,6 +130,19 @@ class ProShieldConfig:
             proxy_centralized_rate_limit_per_minute=_env_int(
                 "PROSHIELD_PROXY_CENTRALIZED_RATE_LIMIT_PER_MINUTE", 5
             ),
+            source_signing_key=_env("PROSHIELD_SOURCE_SIGNING_KEY", ""),
+            source_token_lifetime_seconds=_env_int(
+                "PROSHIELD_SOURCE_TOKEN_LIFETIME_SECONDS", 3600
+            ),
+            ingress_rate_limit_per_minute=_env_int(
+                "PROSHIELD_INGRESS_RATE_LIMIT_PER_MINUTE", 600
+            ),
+            ingress_max_request_bytes=_env_int(
+                "PROSHIELD_INGRESS_MAX_REQUEST_BYTES", 32_768
+            ),
+            ingress_max_response_bytes=_env_int(
+                "PROSHIELD_INGRESS_MAX_RESPONSE_BYTES", 1_048_576
+            ),
             connector_specs=connector_specs,
         )
 
@@ -139,5 +170,10 @@ class ProShieldConfig:
             "proxy_max_response_bytes": self.proxy_max_response_bytes,
             "proxy_centralized_rate_limit_per_minute":
                 self.proxy_centralized_rate_limit_per_minute,
+            "source_signing_key_set": bool(self.source_signing_key),
+            "source_token_lifetime_seconds": self.source_token_lifetime_seconds,
+            "ingress_rate_limit_per_minute": self.ingress_rate_limit_per_minute,
+            "ingress_max_request_bytes": self.ingress_max_request_bytes,
+            "ingress_max_response_bytes": self.ingress_max_response_bytes,
             "connectors": self.connector_specs,
         }

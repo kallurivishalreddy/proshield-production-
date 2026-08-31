@@ -79,6 +79,17 @@ INDEX_SPECS: List[Dict[str, Any]] = [
             ("provenance.source_event_id", ASCENDING),
         ],
     },
+    {
+        # Phase 4.9: source-instance lookups. Sparse so
+        # Phase 4.1-4.8 events (no ``provenance.source_instance_id``)
+        # do not consume index slots.
+        "name": "ev_provenance_source_instance_id",
+        "key": [
+            ("provenance.source_instance_id", ASCENDING),
+            ("event_time", DESCENDING),
+        ],
+        "sparse": True,
+    },
 ]
 
 
@@ -265,6 +276,35 @@ class SecurityEventRepository:
         if doc is None:
             return None
         return _document_to_event(doc)
+
+    def find_by_source_instance(
+        self,
+        source_instance_id: str,
+        *,
+        limit: int = 256,
+    ) -> List[SecurityEvent]:
+        """Return recent events ingested from the given source instance.
+
+        Used by the Phase 4.9 centralised-investigation path to
+        enumerate evidence attached to a specific source instance.
+        """
+        if not isinstance(source_instance_id, str) or not source_instance_id:
+            return []
+        try:
+            cursor = (
+                self._collection
+                .find({"provenance.source_instance_id": source_instance_id})
+                .sort("event_time", -1)
+                .limit(max(1, int(limit)))
+            )
+        except PyMongoError as exc:
+            raise PersistenceError(
+                safe_message="could not list events by source instance",
+                internal_detail=f"find failed: {type(exc).__name__}",
+            ) from exc
+        return [
+            d for d in (_document_to_event(c) for c in cursor) if d
+        ]
 
     def count(self) -> int:
         try:

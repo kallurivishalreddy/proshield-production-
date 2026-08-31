@@ -16,12 +16,21 @@ Phase 4.8 adds the analyst-investigation backend: incident / case
 (``app/incidents/``), reports (``app/reports/``), routing
 (``app/routing/``), the minimal auth foundation (``app/auth/``),
 and the secure application proxy / gateway (``app/proxy/``).
+Phase 4.9 adds Source Management + the trusted external connector
+integration boundary: the authoritative source-instance registry
+(``app/sources/``), the inbound ingress proxy distinct from the
+client-facing ``app/proxy/`` boundary, source-identity
+tokens / trust model, and source-specific provenance carried
+through to the canonical SecurityEvent without redesigning
+Phase 4.1-4.8.
 
 Analyst queue / escalation / advanced severity-aware routing /
-future IAM are explicit future scope.
+future IAM / enterprise IAM / MFA / OIDC federation are explicit
+future scope.
 
 Reference: docs/PROSHIELD_PROJECT_UNDERSTANDING.md
+           docs/PHASE 4/PHASE-04-09-REPORT.md
 """
 
-__version__ = "4.8.0"
-__phase__ = "4.8"
+__version__ = "4.9.0"
+__phase__ = "4.9"
