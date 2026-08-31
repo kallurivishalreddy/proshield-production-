@@ -705,7 +705,7 @@ validate status=200
 enable status=200
 
 ========== STEP 5: ISSUE INGRESS TOKEN ==========
-token: sit-01a05458-cc29-7bc5-bba3-a3ebbb964e8b.eyJleHB...
+token: <REDACTED_TEST_SOURCE_TOKEN>
 
 ========== STEP 6: BENIGN TELEMETRY ==========
 benign ingest status=200

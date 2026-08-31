@@ -194,7 +194,7 @@ class TestSourceInstance:
 class TestSourceIdentityToken:
     def test_basic_validation(self) -> None:
         tok = SourceIdentityToken(
-            token_id="sit-0198c2a1-7e3b-7a8e-b7b6-4f6a7d4d5f12",
+            token_id="sit-00000000-0000-7000-8000-000000000001",
             source_instance_id=(
                 "src-0198c2a1-7e3b-7a8e-b7b6-4f6a7d4d5f12-prod"
             ),
@@ -211,7 +211,7 @@ class TestSourceIdentityToken:
     def test_unknown_source_type_rejected(self) -> None:
         with pytest.raises(ValidationError):
             SourceIdentityToken(
-                token_id="sit-0198c2a1-7e3b-7a8e-b7b6-4f6a7d4d5f12",
+                token_id="sit-00000000-0000-7000-8000-000000000001",
                 source_instance_id=(
                     "src-0198c2a1-7e3b-7a8e-b7b6-4f6a7d4d5f12-prod"
                 ),
@@ -284,3 +284,4 @@ class TestSourceInstanceView:
         assert view.source_type in {
             t.value for t in SourceType
         }
+
