@@ -86,6 +86,7 @@ from .models import (
     CorrelationTrigger,
 )
 from .patterns import BruteForceClusteringPattern, CorrelationPattern
+from .service import CorrelationReadService
 
 __all__ = [
     "BruteForceClusteringPattern",
@@ -95,6 +96,7 @@ __all__ = [
     "CorrelationKey",
     "CorrelationKeyError",
     "CorrelationPattern",
+    "CorrelationReadService",
     "CorrelationResult",
     "CorrelationTrigger",
     "CorrelationWindowError",

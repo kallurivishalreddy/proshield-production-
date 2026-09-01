@@ -104,10 +104,18 @@ class FakeCursor:
     def __init__(self, docs: List[Dict[str, Any]]) -> None:
         self.docs = docs
 
-    def sort(self, key) -> "FakeCursor":
-        for k, direction in reversed(list(key)):
+    def sort(self, key, direction: Optional[int] = None) -> "FakeCursor":
+        """Support both ``sort("field", ASCENDING)`` and ``sort([("field", 1)])``."""
+        if direction is not None:
+            k = key
+            d = direction
             self.docs = sorted(
-                self.docs, key=lambda d, k=k: d.get(k), reverse=(direction == -1)
+                self.docs, key=lambda x, k=k: x.get(k), reverse=(d == -1)
+            )
+            return self
+        for k, d in reversed(list(key)):
+            self.docs = sorted(
+                self.docs, key=lambda x, k=k: x.get(k), reverse=(d == -1)
             )
         return self
 

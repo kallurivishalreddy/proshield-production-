@@ -32,7 +32,7 @@ proxy. **Repositories / services are NOT directly exposed.**
 { "ok": true, "data": { ... } }
 // error
 { "error": { "code": "<error_code>", "message": "<safe_message>" } }
-// not_implemented stub (501)
+// not_implemented stub (501, reserved - no live ops today)
 { "ok": false, "error": { "code": "not_implemented", "message": "operation 'X' is declared but not implemented in the current backend slice", "internal_detail": "..." }, "data": { "operation": "X" } }
 ```
 
@@ -59,11 +59,11 @@ proxy. **Repositories / services are NOT directly exposed.**
 
 | Class | Count | Operations |
 |---|---|---|
-| WIRED AND VERIFIED | 22 | `health`, `auth.issue`, `case.get`, `case.list`, `case.close`, `case.centralized`, `report.get`, `report.list`, `report.generate_normal`, `report.generate_centralized`, `routing.compute`, `source.list`, `source.get`, `source.list_types`, `source.register`, `source.configure`, `source.validate`, `source.enable`, `source.disable`, `source.retire`, `source.issue_token`, plus the 400-boundary `case.create` |
-| NEW BACKEND OPERATION IMPLEMENTED | 1 | `report.export` |
-| BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB) | 16 | `detection.list`, `detection.get`, `detection.list_for_incident`, `correlation.list`, `correlation.get`, `correlation.list_for_incident`, `overview.summary`, `timeline.build_for_incident`, `rule.list`, `rule.get`, `rule.create`, `rule.update`, `rule.version`, `rule.enable`, `rule.disable`, `rule.retire` |
+| WIRED AND VERIFIED | 39 | `health`, `auth.issue`, `case.get`, `case.list`, `case.close`, `case.centralized`, `report.get`, `report.list`, `report.generate_normal`, `report.generate_centralized`, `report.export` (JSON only), `routing.compute`, `source.list`, `source.get`, `source.list_types`, `source.register`, `source.configure`, `source.validate`, `source.enable`, `source.disable`, `source.retire`, `source.issue_token`, `detection.list`, `detection.get`, `detection.list_for_incident`, `correlation.list`, `correlation.get`, `correlation.list_for_incident`, `overview.summary`, `timeline.build_for_incident`, `rule.list`, `rule.get`, `rule.create`, `rule.update`, `rule.version`, `rule.enable`, `rule.disable`, `rule.retire`, plus the 400-boundary `case.create` |
+| NEW BACKEND OPERATION IMPLEMENTED | 0 | (none) |
+| BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB) | 0 | (none) |
 | DEFERRED BY DESIGN | 1 | `case.create` (always 400, Phase 4.8 boundary) |
-| **Total declared** | **40** | (22 wired + 1 new + 16 stub + 1 boundary) |
+| **Total declared** | **40** | (39 wired + 0 new + 0 stub + 1 boundary) |
 
 ---
 
@@ -74,13 +74,13 @@ Purpose: SOC posture at a glance (counts, sources, health).
 ### Action 2.1: Load dashboard summary
 
 - **OP:** `overview.summary`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1351-1358`
 - **Permission:** `Permission.OVERVIEW_READ` (analyst/admin/internal_service)
 - **Request:** `{ }`
-- **Response (501 stub):** `{ "ok": false, "error": { "code": "not_implemented", "message": "operation 'overview.summary' is declared but not implemented in the current backend slice", "internal_detail": "OverviewService.summary is not attached in Phase 4.9" }, "data": { "operation": "overview.summary" } }`
-- **Service:** (none attached) - `OverviewService` to be implemented in future slice
-- **Frontend state:** show graceful 'counts not available - backend stub' message; offer drill-down via `case.list` (see below)
+- **Response:** `{ "ok": true, "data": { "open_cases": <int>, "open_detections": <int>, "open_correlations": <int>, "active_rules": <int> } }`
+- **Service:** `app.overview.service.OverviewReadService` (attached via `SecureProxy.attach_overview_service(...)`)
+- **Frontend state:** show drill-down via `case.list`, `detection.list`, `correlation.list` (see below)
 - **Loading:** button shows spinner while request in flight
 - **Empty state:** if all stub counts are zero, show 'No activity yet'
 - **Error state:** display `error.code`; 501 -> 'not yet implemented' UI; 403 -> 'insufficient permission'; 401 -> 'session expired, re-login'
@@ -216,40 +216,39 @@ Purpose: SOC posture at a glance (counts, sources, health).
 ### Action 4.1: List detections
 
 - **OP:** `detection.list`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1294-1302`
 - **Permission:** `Permission.DETECTION_READ`
 - **Request:** `{ "rule_id": "NGINX-AUTH-FAILURE-001"|null, "event_id": "<uuid7>"|null, "limit": int<=200, "since": "iso8601"|null, "until": "iso8601"|null, "severity": "low"|...|null }`
-- **Response (501 stub):** `{ "ok": false, "error": { "code": "not_implemented", ... } }`
-- **Service:** `DetectionService.list` (not yet attached) - `DetectionRepository.find_by_rule`/`find_by_event_id` (`app/persistence/detection_repository.py:291,322`) exist
-- **Frontend state:** show 'Detection list not available - backend stub' and offer to navigate via `case.get` (which returns `evidence.detection_ids`)
-- **Promotion path:** attach `DetectionService` to `SecureProxy.attach_detection_service(...)` and replace the stub call
-- **Pagination:** future `limit` + cursor (repository methods already support it)
+- **Response:** `{ "ok": true, "data": { "detections": [Detection.to_dict()...] } }`
+- **Service:** `DetectionReadService.list` (attached via `SecureProxy.attach_detection_service(...)`); uses `DetectionRepository.find_by_rule` / `find_by_event_id`
+- **Frontend state:** render the detection list directly; offer navigation via `case.get` (which returns `evidence.detection_ids`)
+- **Pagination:** `limit` default 50, max 200; no cursor
 - **Security boundary:** analyst/admin/internal_service (anyone with `DETECTION_READ`)
 - **IDs/evidence:** `detection_id` (`det-<uuid7>`), `event_id`, `rule_id`
 
 ### Action 4.2: Get detection detail
 
 - **OP:** `detection.get`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1304-1312`
 - **Permission:** `Permission.DETECTION_READ`
 - **Request:** `{ "detection_id": "det-..." }`
-- **Response (501 stub):** `{ "ok": false, "error": { "code": "not_implemented", ... } }`
-- **Service:** `DetectionService.get` (not yet attached) - `DetectionRepository.get_by_detection_id` (`app/persistence/detection_repository.py:274`) exists
-- **Frontend state:** show 'Detection detail not available' or derive from `case.get` evidence (less rich)
+- **Response:** `{ "ok": true, "data": { "detection": Detection.to_dict() } }`
+- **Service:** `DetectionReadService.get` (attached via `SecureProxy.attach_detection_service(...)`); uses `DetectionRepository.get_by_detection_id`
+- **Frontend state:** render the detection detail directly
 - **IDs/evidence:** `detection_id`, `event_id`, `rule_id`, `rule_version`, `category`, `reasoning`, `evidence_refs`, `detected_at`
 
 ### Action 4.3: List detections for an incident
 
 - **OP:** `detection.list_for_incident`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1314-1322`
 - **Permission:** `Permission.DETECTION_READ`
 - **Request:** `{ "incident_id": "case-..." }`
-- **Response (501 stub):** `{ "ok": false, "error": { "code": "not_implemented", ... } }`
-- **Service:** `DetectionService.list_for_incident` (not yet attached); cross-references `case.evidence.detection_ids` with `DetectionRepository.find_by_event_id`
-- **Frontend state:** show 'Detections for this case not available' or use the IDs from `case.get` + future `detection.get`
+- **Response:** `{ "ok": true, "data": { "detections": [Detection.to_dict()...] } }`
+- **Service:** `DetectionReadService.list_for_incident` (attached via `SecureProxy.attach_detection_service(...)`); calls `IncidentService.get_case(identity, incident_id)` first for IDOR defense, then `DetectionRepository.find_by_event_id` for each event id
+- **Frontend state:** render the case-scoped detection list directly
 - **IDs/evidence:** `detection_id`[], `event_id`[], `rule_id`[]
 ---
 
@@ -258,34 +257,34 @@ Purpose: SOC posture at a glance (counts, sources, health).
 ### Action 5.1: List correlations
 
 - **OP:** `correlation.list`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1324-1332`
 - **Permission:** `Permission.CORRELATION_READ`
 - **Request:** `{ "pattern_id": "brute_force_clustering"|null, "since": "iso8601"|null, "until": "iso8601"|null, "limit": int<=200 }`
-- **Response (501 stub):** `{ "ok": false, "error": { "code": "not_implemented", ... } }`
-- **Service:** `CorrelationService.list` (not yet attached) - `CorrelationRepository.find_by_pattern` (`app/persistence/correlation_repository.py:252`) exists
+- **Response:** `{ "ok": true, "data": { "correlations": [Correlation.to_dict()...] } }`
+- **Service:** `CorrelationReadService.list` (attached via `SecureProxy.attach_correlation_service(...)`); unfiltered call returns `[]` (unbounded-query invariant); uses `CorrelationRepository.find_by_pattern`
 - **IDs/evidence:** `correlation_id` (`corr-<uuid7>`), `pattern_id`, `pattern_version`, `trigger`, `key.parts[]`, `detection_ids[]`, `event_ids[]`
 
 ### Action 5.2: Get correlation detail
 
 - **OP:** `correlation.get`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1334-1342`
 - **Permission:** `Permission.CORRELATION_READ`
 - **Request:** `{ "correlation_id": "corr-..." }`
-- **Response (501 stub):** `{ "ok": false, "error": { "code": "not_implemented", ... } }`
-- **Service:** `CorrelationService.get` (not yet attached) - `CorrelationRepository.get_by_correlation_id` (`app/persistence/correlation_repository.py:234`) exists
+- **Response:** `{ "ok": true, "data": { "correlation": Correlation.to_dict() } }`
+- **Service:** `CorrelationReadService.get` (attached via `SecureProxy.attach_correlation_service(...)`); uses `CorrelationRepository.get_by_correlation_id`
 - **IDs/evidence:** `correlation_id`, `pattern_id`, `pattern_version`, `trigger`, `key.parts[]`, `count`, `window_start`, `window_end`, `reasoning`, `detection_ids[]`, `event_ids[]`
 
 ### Action 5.3: List correlations for an incident
 
 - **OP:** `correlation.list_for_incident`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1344-1352`
 - **Permission:** `Permission.CORRELATION_READ`
 - **Request:** `{ "incident_id": "case-..." }`
-- **Response (501 stub):** `{ "ok": false, "error": { "code": "not_implemented", ... } }`
-- **Service:** `CorrelationService.list_for_incident` (not yet attached); cross-references `case.evidence.correlation_ids` (or `case.centralized_correlation_ids` for centralized) with `CorrelationRepository`
+- **Response:** `{ "ok": true, "data": { "correlations": [Correlation.to_dict()...] } }`
+- **Service:** `CorrelationReadService.list_for_incident` (attached via `SecureProxy.attach_correlation_service(...)`); calls `IncidentService.get_case(identity, incident_id)` first for IDOR defense, then looks up each `case.evidence.correlation_ids` (or `case.centralized_correlation_ids` for centralized) via `CorrelationRepository.get_by_correlation_id`
 - **IDs/evidence:** `correlation_id`[] (with metadata)
 
 ### Action 5.4: Centralized analysis (request)
@@ -406,76 +405,73 @@ Purpose: SOC posture at a glance (counts, sources, health).
 
 ## 7. Component 6: Rules
 
-All 8 rule ops are currently **BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)**. The backend `RuleManagementService` and the `RuleRegistry` governance (CANDIDATE not enablable, version monotonicity, retired immutable) are fully implemented and tested. Promotion is a 3-step mechanical change:
-1. Import the service in `app/proxy/proxy.py`
-2. Add a `SecureProxy.attach_rule_management_service(...)` method
-3. Replace the `_not_implemented_stub(...)` call with the live implementation
+All 8 rule ops are **WIRED AND VERIFIED** as of Phase 4.10. The backend `RuleManagementService` and the `RuleRegistry` governance (CANDIDATE not enablable, version monotonicity, retired immutable) are fully implemented and tested, and are attached to the proxy via `SecureProxy.attach_rule_management_service(...)`.
 
 ### Action 7.1: List rules
 
 - **OP:** `rule.list`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1370-1378`
 - **Permission:** `Permission.RULE_READ`
-- **Service (when wired):** `RuleManagementService.list_all`/`list_latest` (`app/rules/management/service.py`)
+- **Service:** `RuleManagementService.list_all` / `list_latest` (`app/rules/management/service.py`), attached via `SecureProxy.attach_rule_management_service(...)`
 - **IDs/evidence:** `rule_id` (e.g. `NGINX-AUTH-FAILURE-001`), `version`
 
 ### Action 7.2: Get rule detail
 
 - **OP:** `rule.get`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1380-1388`
 - **Permission:** `Permission.RULE_READ`
-- **Service (when wired):** `RuleManagementService.get` -> `RuleRepository.get`
+- **Service:** `RuleManagementService.get` -> `RuleRepository.get`
 
 ### Action 7.3: Create rule
 
 - **OP:** `rule.create`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1390-1398`
 - **Permission:** `Permission.RULE_WRITE` (admin only)
-- **Service (when wired):** `RuleManagementService.create` -> `RuleRepository.create`
+- **Service:** `RuleManagementService.create` -> `RuleRepository.create`
 - **Governance:** CANDIDATE state by default; cannot be enabled until promoted to APPROVED
 
 ### Action 7.4: Update rule (new version)
 
 - **OP:** `rule.update`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1400-1408`
 - **Permission:** `Permission.RULE_WRITE`
-- **Service (when wired):** `RuleManagementService.update` (creates new version; old version superseded)
+- **Service:** `RuleManagementService.update` (creates new version; old version superseded)
 
 ### Action 7.5: Version rule
 
 - **OP:** `rule.version`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1410-1418`
 - **Permission:** `Permission.RULE_WRITE`
-- **Service (when wired):** `RuleManagementService.create_new_version`
+- **Service:** `RuleManagementService.create_new_version`
 
 ### Action 7.6: Enable rule
 
 - **OP:** `rule.enable`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1420-1428`
 - **Permission:** `Permission.RULE_WRITE`
-- **Service (when wired):** `RuleManagementService.set_enabled` -> `RuleRegistry.set_enabled` (enforces CANDIDATE-not-enablable + SupersededVersionNotReenablable)
+- **Service:** `RuleManagementService.set_enabled(True, ...)` -> `RuleRegistry.set_enabled` (enforces CANDIDATE-not-enablable + SupersededVersionNotReenablable)
 
 ### Action 7.7: Disable rule
 
 - **OP:** `rule.disable`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1430-1438`
 - **Permission:** `Permission.RULE_WRITE`
-- **Service (when wired):** `RuleManagementService.set_enabled(False, ...)`
+- **Service:** `RuleManagementService.set_enabled(False, ...)`
 
 ### Action 7.8: Retire rule
 
 - **OP:** `rule.retire`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1440-1448`
 - **Permission:** `Permission.RULE_WRITE`
-- **Service (when wired):** `RuleManagementService.set_state(RETIRED)` (soft-delete; immutable)
+- **Service:** `RuleManagementService.set_state(RETIRED)` (soft-delete; immutable)
 ---
 
 ## 8. Component 7: Timeline
@@ -483,17 +479,17 @@ All 8 rule ops are currently **BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)**.
 ### Action 8.1: Build timeline for an incident
 
 - **OP:** `timeline.build_for_incident`
-- **Class:** BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)
+- **Class:** WIRED AND VERIFIED
 - **Handler:** `app/proxy/proxy.py:1360-1368`
 - **Permission:** `Permission.TIMELINE_READ`
 - **Request:** `{ "incident_id": "case-..." }`
-- **Response (501 stub):** `{ "ok": false, "error": { "code": "not_implemented", ... } }`
-- **Service (when wired):** `TimelineEngine.run(events, detections, correlations)` (`app/timeline/engine.py`)
+- **Response:** `{ "ok": true, "data": { "timeline": { "items": [TimelineEvent.to_dict()...] } } }`
+- **Service:** `TimelineReadService.build_for_incident` (attached via `SecureProxy.attach_timeline_service(...)`); orchestrates `TimelineEngine.run(events, detections, correlations)` (`app/timeline/engine.py`) and calls `IncidentService.get_case(identity, incident_id)` first for IDOR defense
 - **Verified contract (from engine code):**
   - Chronological order: `(occurred_at, kind, source_id)`
   - Deduplication: each `(kind, source_id)` emitted once
   - Evidence linking: events carry `[event_id, collector]`; detections carry `[detection_id, event_id, *evidence_refs]`; correlations carry `[correlation_id, *detection_ids, *event_ids]`
-- **Frontend state:** show 'Timeline not available' or use the timeline rendered inside `report.get` (which embeds `TimelineResult.items` as `ReportItem`s)
+- **Frontend state:** render the timeline directly; embedded `ReportItem`s inside `report.get` remain supported
 - **IDs/evidence:** `event_id`, `detection_id`, `correlation_id`, `source_id`
 
 ### Action 8.2: Filter by time range / source / kind
@@ -547,13 +543,14 @@ All 8 rule ops are currently **BACKEND EXISTS - FRONTEND NOT WIRED (501 STUB)**.
 ### Action 9.5: Export report (NEW OP)
 
 - **OP:** `report.export`
-- **Class:** NEW BACKEND OPERATION IMPLEMENTED (501 STUB)
+- **Class:** WIRED AND VERIFIED (JSON only)
 - **Handler:** `app/proxy/proxy.py:1447-1452`
 - **Permission:** `Permission.REPORT_READ`
-- **Request:** `{ "report_id": "rpt-...", "format": "json"|"pdf"|"csv"|"text" }`
-- **Response (501 stub):** `{ "ok": false, "error": { "code": "not_implemented", ... } }`
-- **Workaround:** frontend serializes the JSON returned by `report.get`
-- **Future:** add a `ReportExporter` service + format templates; no security-sensitive work needed
+- **Request:** `{ "report_id": "rpt-...", "format": "json" }`
+- **Response:** `{ "ok": true, "data": { "report_id": "rpt-...", "format": "json", "payload": Report.to_dict() } }`
+- **Service:** `ReportService` (attached via `SecureProxy.attach_report_service(...)`)
+- **Format support:** JSON is wired; PDF/CSV/text return 400 with a documented envelope (deferred to a future slice)
+- **Note:** the wire payload is the same shape as `report.get`
 
 ---
 
@@ -585,12 +582,12 @@ Cross-analyst access to a case or report returns `404 case_not_found` (existence
 - `case.list`: `state` + `limit` (default 50, max 200); no cursor today
 - `report.list`: `incident_id?` + `limit` (default 20, max 100); no cursor today
 - `source.list`: unbounded; cap recommended in future
-- `*_list_for_incident` / `*_list` (501 stubs): pagination designed but not yet live
+- `*_list_for_incident` / `*_list` (now wired as of Phase 4.10): pagination designed but not yet live
 
 ### 11.4 Performance / no N+1
 
 - All list endpoints are capped (no unbounded queries)
-- `case.get` returns evidence **IDs** only; the UI must call `detection.get` (501 stub today) or `correlation.get` (501 stub today) for full payloads - no N+1 on the backend
+- `case.get` returns evidence **IDs** only; the UI must call `detection.get` or `correlation.get` for full payloads - no N+1 on the backend
 - Indexed Mongo queries (event_id, source_instance_id, rule_id, correlation_id, detection_id) ensure <50 ms p99
 - The proxy caps response body at 1 MiB (`proxy_max_response_bytes`) and request body at 32 KiB (`proxy_max_request_bytes`); a 500 `response_too_large` is returned otherwise
 
@@ -634,10 +631,10 @@ Cross-analyst access to a case or report returns `404 case_not_found` (existence
 | 429 | (rate limited) | per-subject / per-caller budget exhausted |
 | 500 | `response_too_large` | response body > 1 MiB |
 | 500 | `internal error` | unexpected exception (safe envelope) |
-| 501 | `not_implemented` | declared but not yet wired (16 ops) |
+| 501 | `not_implemented` | reserved: would be returned if a future op is declared without a handler (no live ops today) |
 
 ---
 
 ## 12. Sign-off
 
-This is the **frozen** wire contract for the Phase 4 frontend. Every UI action is bound to a `SecureProxy.handle(ProxyRequest)` call. The 22 wired ops are verified against the current source (test coverage in §2 of `PROSHIELD-FINAL-BACKEND-VERIFICATION.md`); the 16 stub ops return a documented 501 `not_implemented` envelope; the 1 boundary op (`case.create`) returns a documented 400. **Zero accidental frontend dependencies on a 501 stub.**
+This is the **frozen** wire contract for the Phase 4 frontend. Every UI action is bound to a `SecureProxy.handle(ProxyRequest)` call. The 39 wired ops are verified against the current source (test coverage in §2 of `PROSHIELD-FINAL-BACKEND-VERIFICATION.md` and `tests/unit/test_phase410_proxy_wiring.py` + `tests/integration/test_phase410_pipeline.py`); the 1 boundary op (`case.create`) returns a documented 400. **Zero accidental frontend dependencies on a 501 stub.**

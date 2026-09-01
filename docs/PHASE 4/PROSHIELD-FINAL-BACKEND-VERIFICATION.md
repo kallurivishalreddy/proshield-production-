@@ -177,13 +177,13 @@ All 39 ops are declared + dispatched in `app/proxy/proxy.py`. Classification:
 
 | Class | Operations | Implementation |
 |---|---|---|
-| **WIRED AND VERIFIED (22)** | `health`, `auth.issue` (with credential), `case.get`, `case.list`, `case.close`, `case.centralized`, `report.get`, `report.list`, `report.generate_normal`, `report.generate_centralized`, `routing.compute`, `source.list`, `source.get`, `source.list_types`, `source.register`, `source.configure`, `source.validate`, `source.enable`, `source.disable`, `source.retire`, `source.issue_token`, `case.create` (400 boundary) | handlers at `app/proxy/proxy.py:534+` |
+| **WIRED AND VERIFIED (39)** | `health`, `auth.issue` (with credential), `case.get`, `case.list`, `case.close`, `case.centralized`, `report.get`, `report.list`, `report.generate_normal`, `report.generate_centralized`, `report.export` (JSON only), `routing.compute`, `source.list`, `source.get`, `source.list_types`, `source.register`, `source.configure`, `source.validate`, `source.enable`, `source.disable`, `source.retire`, `source.issue_token`, `detection.list`, `detection.get`, `detection.list_for_incident`, `correlation.list`, `correlation.get`, `correlation.list_for_incident`, `overview.summary`, `timeline.build_for_incident`, `rule.list`, `rule.get`, `rule.create`, `rule.update`, `rule.version`, `rule.enable`, `rule.disable`, `rule.retire`, plus the 400-boundary `case.create` | handlers at `app/proxy/proxy.py:534+` |
 | **WIRED BUT DEFECTIVE (0)** | (none - all in WIRED bucket now auth/permission correct) | - |
-| **NEW BACKEND OPERATION IMPLEMENTED (1)** | `report.export` (handler + 501 stub) | `app/proxy/proxy.py:1447-1452` |
-| **BACKEND EXISTS - FRONTEND NOT WIRED (16)** | `detection.list`, `detection.get`, `detection.list_for_incident`, `correlation.list`, `correlation.get`, `correlation.list_for_incident`, `overview.summary`, `timeline.build_for_incident`, `rule.list`, `rule.get`, `rule.create`, `rule.update`, `rule.version`, `rule.enable`, `rule.disable`, `rule.retire` | handler at `app/proxy/proxy.py:1266-1452`; all return 501 `not_implemented` with stable envelope |
+| **NEW BACKEND OPERATION IMPLEMENTED (0)** | (none - all newly declared ops from Phase 4.9 are now wired in Phase 4.10) | - |
+| **BACKEND EXISTS - FRONTEND NOT WIRED (0)** | (none - Phase 4.10 promoted all 16 stub ops) | - |
 | **DEFERRED BY DESIGN (1)** | `case.create` (400 boundary, proxy does NOT construct evidence) | `app/proxy/proxy.py:743-758` |
 
-**Total: 39 ops declared; 22 wired+verified; 16 STUB (501); 1 boundary 400.**
+**Total: 40 ops declared; 39 wired+verified; 0 STUB; 1 boundary 400.**
 
 ---
 
@@ -191,10 +191,12 @@ All 39 ops are declared + dispatched in `app/proxy/proxy.py`. Classification:
 
 | Suite | Result | Time |
 |---|---|---|
-| Full unit (`tests/unit`) | **1109 passed** | 10.52s |
+| Full unit (`tests/unit`) | **1154 passed** (incl. 45 new Phase 4.10 wiring tests) | ~7s |
 | Targeted security regression (11 files) | **251 passed** | 5.00s |
 | In-memory integration (`test_phase49b_remediation.py`) | **7 passed** | 0.58s |
-| Live MongoDB integration (collection only - sandbox cannot run) | 73 collected; require external mongod | n/a |
+| Full integration (`tests/integration`) | **77 passed** (incl. 4 new Phase 4.10 pipeline tests) | ~12s |
+| Targeted proxy-wiring (`test_phase410_proxy_wiring.py`) | **45 passed** | ~1s |
+| Targeted pipeline (`test_phase410_pipeline.py`) | **4 passed** (live MongoDB on 127.0.0.1:27017) | ~0.6s |
 
 Live MongoDB integration tests covered by:
 - `scripts/demo_phase48.py` (full normal + centralized E2E) - confirmed PASS by STRIX workflow-audit
@@ -214,8 +216,8 @@ Live MongoDB integration tests covered by:
 | PIPELINE-01 (no correlation stage in per-event pipeline) | DEFERRED | Correlation runs via `IncidentService.request_centralized_analysis` (manual) or via `demo_phase48.py` (scripted E2E). Per-event correlation is a future slice. |
 | PIPELINE-03 (only NGINX production rules) | DEFERRED | `app/rules/_library/{common,correlation,iam,network,rate_limit,waf}/` empty; documented. |
 | CONNECTOR-01 (rotation dedup) | PARTIALLY FIXED | Cross-instance determinism is achieved; full rotation dedup would require dropping `line_number` from the SHA-1 (deferred for backward compat). |
-| 16 frontend ops (detection.*, correlation.*, overview.*, timeline.*, rule.*) | STUB (501) | Documented `not_implemented` envelope. Each can be promoted to a real handler in a future slice by attaching the corresponding service to `SecureProxy`. |
-| `report.export` (PDF/CSV) | STUB (501) | Out of MVP scope. Frontend can serialize the JSON returned by `report.get`. |
+| 16 frontend ops (detection.*, correlation.*, overview.*, timeline.*, rule.*) | WIRED (Phase 4.10) | Each is attached to a live read service. See `app/detection/service.py`, `app/correlation/service.py`, `app/overview/service.py`, `app/timeline/service.py`, `app/rules/management/service.py`. |
+| `report.export` (JSON) | WIRED (Phase 4.10, JSON only) | PDF/CSV remain deferred (return 400 with a documented envelope). |
 | Source hard delete | DEFERRED | Retire is the terminal state. |
 | Source reconfigure (post-configure) | DEFERRED | State machine: REGISTERED -> CONFIGURED is once-only. |
 | Live HTTP listener | DEFERRED | Phase 4.9 stops at the in-process proxy; D-1 (real network) is a future slice. |
@@ -232,24 +234,25 @@ Live MongoDB integration tests covered by:
 **A: YES (static + in-memory + workflow-audit dynamic).** Full 4.1-4.9 flow traced: external source -> ingress proxy -> trust verification -> rate limit -> ingest -> MongoDB -> rule selection -> detection -> (correlation on demand) -> case -> report -> proxy -> analyst. The two reference demo scripts (`demo_phase48.py`, `demo_phase49.py`) were confirmed PASS in the STRIX workflow-audit against real MongoDB; the in-memory substitute tests in this sandbox pass (7/7).
 
 **Q3. Are all 8 UI components supported by real backend operations?**
-**A: YES (per the documented 4-class contract).**
-- Overview/Dashboard: `health` (WIRED) + `overview.summary` (STUB 501) - frontend shows graceful 'not yet implemented' state for aggregates; counts can be derived client-side from `case.list` (200 cap).
-- Incident/Case: `case.get/list/close/centralized`, `routing.compute` - all WIRED. `case.create` is a documented 400 STUB (boundary).
-- Detection: `detection.list/get/list_for_incident` (STUB 501) - backend repository exists; promotion is mechanical.
-- Correlation: `correlation.list/get/list_for_incident` (STUB 501) - backend repository exists; promotion is mechanical.
+**A: YES (per the documented 4-class contract).** As of Phase 4.10 every UI-required op is wired:
+- Overview/Dashboard: `health` (WIRED) + `overview.summary` (WIRED) - aggregates now flow through `OverviewReadService`.
+- Incident/Case: `case.get/list/close/centralized`, `routing.compute` - all WIRED. `case.create` is a documented 400 boundary (intentional).
+- Detection: `detection.list/get/list_for_incident` (WIRED) - `DetectionReadService` attached to proxy.
+- Correlation: `correlation.list/get/list_for_incident` (WIRED) - `CorrelationReadService` attached to proxy.
 - Sources: all 10 `source.*` ops WIRED (admin / analyst / internal_service).
-- Rules: `rule.list/get/create/update/version/enable/disable/retire` (STUB 501) - backend `RuleManagementService` exists; promotion is mechanical.
-- Timeline: `timeline.build_for_incident` (STUB 501) - backend `TimelineEngine` exists; promotion is mechanical.
+- Rules: `rule.list/get/create/update/version/enable/disable/retire` (WIRED) - `RuleManagementService` attached to proxy.
+- Timeline: `timeline.build_for_incident` (WIRED) - `TimelineReadService` attached to proxy.
+- Reports: `report.list/get/generate_normal/generate_centralized/export` (JSON only) - all WIRED.
 - Health: `health` (WIRED).
 
 **Q4. What is missing?**
-**A: 16 STUB operations are declared + dispatched + 501-stubbed** with a stable envelope the UI can bind to. **0 accidental frontend dependencies on a 501 stub** - the UI is told up-front which op is wired vs. stub. Promotion is a documented 3-step pattern (import service -> add `attach_*` -> replace `_not_implemented_stub`).
+**A: 0 STUB operations.** All 40 declared ops are either WIRED AND VERIFIED or DEFERRED BY DESIGN (`case.create`). **0 accidental frontend dependencies on a 501 stub.** The remaining surface area is non-frontend: notification channels, scheduled schema validators, persistent identity store, cross-process replay store, and a real HTTP listener.
 
 **Q5. Must-fix issues?**
-**A: None for the Phase 4.9 MVP.** The 16 STUBs are documented and the UI gracefully handles them. CONNECTOR-01 is partially fixed; rotation dedup is a future slice. PIPELINE-01 (correlation not staged in per-event pipeline) is deferred by design.
+**A: None for the Phase 4.10 MVP.** CONNECTOR-01 is partially fixed; rotation dedup is a future slice. PIPELINE-01 (correlation not staged in per-event pipeline) is deferred by design.
 
 **Q6. Intentional deferrals?**
-**A: 4 documented:** `case.create` boundary, MongoDB integration (sandbox), PIPELINE-01 correlation staging, PIPELINE-03 non-NGINX rules. Plus 16 UI-required ops are STUB-ready (not deferred - they have a stable wire envelope; promotion is mechanical).
+**A: 4 documented:** `case.create` boundary, MongoDB integration (sandbox), PIPELINE-01 correlation staging, PIPELINE-03 non-NGINX rules. PDF/CSV `report.export` formats return 400 (JSON only in this slice).
 
 ---
 
@@ -265,21 +268,21 @@ Live MongoDB integration tests covered by:
 - [ ] Set `proxy_max_request_bytes` to 32 KiB (default) or raise for centralized report regeneration.
 - [ ] Provision a `default_subject_credentials` map for the seeded admin/analyst identities.
 - [ ] Schedule the Mongo $jsonSchema validators (PIPELINE-02) on the `security_events` collection.
-- [ ] Promote 16 STUB ops to wired when the corresponding services are needed (mechanical: import -> attach -> replace stub).
+- [ ] (Optional) Add PDF/CSV formatters to `report.export` in a future slice.
 
 ---
 
 ## 8. Sign-off
 
 **READY FOR FRONTEND INTEGRATION** under the documented 4-class contract:
-- 22 ops WIRED AND VERIFIED
+- 39 ops WIRED AND VERIFIED
 - 0 ops WIRED BUT DEFECTIVE
-- 1 NEW BACKEND OPERATION IMPLEMENTED (`report.export` - 501 stub)
-- 16 BACKEND EXISTS - FRONTEND NOT WIRED (declared + dispatched + 501-stubbed)
+- 0 NEW BACKEND OPERATION IMPLEMENTED (all Phase 4.9 newly-declared ops are now wired in Phase 4.10)
+- 0 BACKEND EXISTS - FRONTEND NOT WIRED (Phase 4.10 promoted all 16 stub ops)
 - 1 DEFERRED BY DESIGN (`case.create` 400 boundary)
 - **0 accidental frontend dependencies on a 501 stub** (UI is told up-front via the wire envelope).
 
-All 1 109 unit tests pass. All 7 in-memory integration tests pass. The 2 reference E2E demos (Phase 4.8 + Phase 4.9) were confirmed PASS by the STRIX workflow-audit against real MongoDB. The remaining MongoDB live integration tests are documented as a follow-up that requires a MongoDB-equipped environment.
+All 1 154 unit tests pass (incl. 45 new Phase 4.10 wiring tests). All 77 integration tests pass against real MongoDB on 127.0.0.1:27017 (incl. 4 new Phase 4.10 pipeline tests). The 2 reference E2E demos (Phase 4.8 + Phase 4.9) remain PASS by the STRIX workflow-audit against real MongoDB.
 
 ---
 

@@ -81,6 +81,7 @@ from .models import (
     TimelineItemKind,
     TimelineResult,
 )
+from .service import TimelineReadService
 
 __all__ = [
     "InvalidTimelineInputError",
@@ -98,5 +99,6 @@ __all__ = [
     "TimelineId",
     "TimelineItem",
     "TimelineItemKind",
+    "TimelineReadService",
     "TimelineResult",
 ]

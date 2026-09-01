@@ -21,6 +21,8 @@ from ..auth.session import (
     SessionVerifier,
 )
 from ..config import ProShieldConfig
+from ..correlation.service import CorrelationReadService
+from ..detection.service import DetectionReadService
 from ..domain.errors import (
     AuthenticationRequiredError,
     AuthorizationError,
@@ -29,8 +31,12 @@ from ..domain.errors import (
     ValidationError as DomainValidationError,
 )
 from ..incidents import IncidentService, authorize_case_access
+from ..overview.service import OverviewReadService
 from ..reports import ReportService
+from ..reports.models import Report
 from ..routing import RoutingEngine
+from ..rules.management.service import RuleManagementService
+from ..timeline.service import TimelineReadService
 from .errors import (
     InvalidProxyRequestError,
     ProxyRateLimitedError,
@@ -255,6 +261,16 @@ class SecureProxy:
         self._report_service = report_service
         self._routing_engine = routing_engine or RoutingEngine()
         self._source_management_service = source_management_service
+        # Phase 4.10 wire-promotion: each is attached lazily
+        # via ``attach_*`` (mirrors the source-management
+        # pattern). Keeping them optional preserves the
+        # ``proxy-without-services`` test fixtures.
+        self._detection_service: Optional[DetectionReadService] = None
+        self._correlation_service: Optional[CorrelationReadService] = None
+        self._overview_service: Optional[OverviewReadService] = None
+        self._timeline_service: Optional[TimelineReadService] = None
+        self._rule_management_service: Optional[RuleManagementService] = None
+        self._security_event_repository: Optional[Any] = None
         self._rate_limiter = _RateLimiter(
             window_seconds=60,
             budget=int(config.proxy_rate_limit_per_minute),
@@ -338,6 +354,100 @@ class SecureProxy:
                 f"{missing}"
             )
         self._source_management_service = service
+
+    def attach_detection_service(
+        self, service: Optional[DetectionReadService],
+    ) -> None:
+        """Attach the Phase 4.10 detection read service.
+
+        Accepts ``None`` to detach (handy for tests that want to
+        assert the stub envelope). When ``service`` is not ``None``
+        it must be a :class:`DetectionReadService`.
+        """
+        if service is None:
+            self._detection_service = None
+            return
+        if not isinstance(service, DetectionReadService):
+            raise ValueError(
+                f"service must be a DetectionReadService, "
+                f"got {type(service).__name__}"
+            )
+        self._detection_service = service
+
+    def attach_correlation_service(
+        self, service: Optional[CorrelationReadService],
+    ) -> None:
+        """Attach the Phase 4.10 correlation read service."""
+        if service is None:
+            self._correlation_service = None
+            return
+        if not isinstance(service, CorrelationReadService):
+            raise ValueError(
+                f"service must be a CorrelationReadService, "
+                f"got {type(service).__name__}"
+            )
+        self._correlation_service = service
+
+    def attach_overview_service(
+        self, service: Optional[OverviewReadService],
+    ) -> None:
+        """Attach the Phase 4.10 overview read service."""
+        if service is None:
+            self._overview_service = None
+            return
+        if not isinstance(service, OverviewReadService):
+            raise ValueError(
+                f"service must be an OverviewReadService, "
+                f"got {type(service).__name__}"
+            )
+        self._overview_service = service
+
+    def attach_timeline_service(
+        self, service: Optional[TimelineReadService],
+        *,
+        security_event_repository: Optional[Any] = None,
+    ) -> None:
+        """Attach the Phase 4.10 timeline read service.
+
+        The timeline service needs an event repository to resolve
+        ``case.evidence.event_ids`` to :class:`SecurityEvent`
+        instances. Pass ``security_event_repository`` at attach
+        time so the proxy can hand it to the service.
+        """
+        if service is None:
+            self._timeline_service = None
+            self._security_event_repository = None
+            return
+        if not isinstance(service, TimelineReadService):
+            raise ValueError(
+                f"service must be a TimelineReadService, "
+                f"got {type(service).__name__}"
+            )
+        self._timeline_service = service
+        self._security_event_repository = security_event_repository
+
+    def attach_rule_management_service(
+        self, service: Optional[RuleManagementService],
+    ) -> None:
+        """Attach the Phase 4.10 rule management service.
+
+        The service is the Phase 4.7
+        :class:`app.rules.management.service.RuleManagementService`;
+        all 8 rule ops (`rule.list`, `rule.get`, `rule.create`,
+        `rule.update`, `rule.version`, `rule.enable`,
+        `rule.disable`, `rule.retire`) are routed through it.
+
+        Accepts ``None`` to detach.
+        """
+        if service is None:
+            self._rule_management_service = None
+            return
+        if not isinstance(service, RuleManagementService):
+            raise ValueError(
+                f"service must be a RuleManagementService, "
+                f"got {type(service).__name__}"
+            )
+        self._rule_management_service = service
 
     # ----- request dispatch
     def handle(self, request: ProxyRequest) -> ProxyResponse:
@@ -457,6 +567,40 @@ class SecureProxy:
                 },
             )
         return ProxyResponse(status=200, body={"ok": True, "data": payload})
+
+    def _coerce_iso(self, value: Any, field_name: str) -> Optional[datetime]:
+        """Convert a wire payload value to a UTC datetime.
+
+        Accepts a ``datetime`` (returned as-is), an ISO 8601
+        string (``...Z`` suffix normalised to ``+00:00``), or
+        ``None``. A malformed string raises
+        :class:`InvalidProxyRequestError` so the wire does not
+        leak the underlying parser error.
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str) and value:
+            try:
+                return datetime.fromisoformat(
+                    value.replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise InvalidProxyRequestError(
+                    safe_message=(
+                        f"invalid {field_name} (must be ISO 8601)"
+                    ),
+                    internal_detail=str(exc),
+                    field=field_name,
+                )
+        raise InvalidProxyRequestError(
+            safe_message=f"invalid {field_name}",
+            internal_detail=(
+                f"{field_name} must be ISO 8601 string or None"
+            ),
+            field=field_name,
+        )
 
     def _extract_session_token(
         self, request: ProxyRequest
@@ -1290,166 +1434,449 @@ class SecureProxy:
         )
 
     # ----- detection / correlation / overview / timeline
+    def _require_detection_service(self) -> DetectionReadService:
+        svc = self._detection_service
+        if svc is None:
+            raise InvalidProxyRequestError(
+                safe_message="detection service unavailable",
+                internal_detail="proxy not wired",
+            )
+        return svc
+
+    def _require_correlation_service(self) -> CorrelationReadService:
+        svc = self._correlation_service
+        if svc is None:
+            raise InvalidProxyRequestError(
+                safe_message="correlation service unavailable",
+                internal_detail="proxy not wired",
+            )
+        return svc
+
+    def _require_overview_service(self) -> OverviewReadService:
+        svc = self._overview_service
+        if svc is None:
+            raise InvalidProxyRequestError(
+                safe_message="overview service unavailable",
+                internal_detail="proxy not wired",
+            )
+        return svc
+
+    def _require_timeline_service(self) -> TimelineReadService:
+        svc = self._timeline_service
+        if svc is None:
+            raise InvalidProxyRequestError(
+                safe_message="timeline service unavailable",
+                internal_detail="proxy not wired",
+            )
+        return svc
+
+    def _require_rule_management_service(self) -> RuleManagementService:
+        svc = self._rule_management_service
+        if svc is None:
+            raise InvalidProxyRequestError(
+                safe_message="rule management service unavailable",
+                internal_detail="proxy not wired",
+            )
+        return svc
+
     def _handle_detection_list(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.DETECTION_READ)
-        return self._not_implemented_stub(
-            "detection.list",
-            "DetectionService.list is not attached in Phase 4.9",
+        svc = self._require_detection_service()
+        body = request.body or {}
+        rule_id = body.get("rule_id")
+        event_id = body.get("event_id")
+        limit = body.get("limit")
+        detections = svc.list(
+            rule_id=rule_id if isinstance(rule_id, str) else None,
+            event_id=event_id if isinstance(event_id, str) else None,
+            limit=limit if isinstance(limit, int) else None,
         )
+        return self._shape_ok({
+            "detections": [d.to_dict() for d in detections],
+        })
 
     def _handle_detection_get(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.DETECTION_READ)
-        return self._not_implemented_stub(
-            "detection.get",
-            "DetectionService.get is not attached in Phase 4.9",
-        )
+        svc = self._require_detection_service()
+        body = request.body or {}
+        did = body.get("detection_id")
+        if not isinstance(did, str) or not did:
+            raise InvalidProxyRequestError(
+                safe_message="detection_id required",
+                internal_detail="missing detection_id",
+                field="detection_id",
+            )
+        d = svc.get(did)
+        return self._shape_ok({"detection": d.to_dict()})
 
     def _handle_detection_list_for_incident(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.DETECTION_READ)
-        return self._not_implemented_stub(
-            "detection.list_for_incident",
-            "DetectionService.list_for_incident is not attached "
-            "in Phase 4.9",
+        svc = self._require_detection_service()
+        body = request.body or {}
+        iid = body.get("incident_id")
+        if not isinstance(iid, str) or not iid:
+            raise InvalidProxyRequestError(
+                safe_message="incident_id required",
+                internal_detail="missing incident_id",
+                field="incident_id",
+            )
+        if self._incident_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="incident service unavailable",
+                internal_detail="proxy not wired",
+            )
+        case = self._incident_service.get_case(
+            identity=identity, incident_id=iid,
         )
+        limit = body.get("limit")
+        detections = svc.list_for_incident(
+            incident_event_ids=tuple(case.evidence.event_ids),
+            limit=limit if isinstance(limit, int) else None,
+        )
+        return self._shape_ok({
+            "detections": [d.to_dict() for d in detections],
+        })
 
     def _handle_correlation_list(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.CORRELATION_READ)
-        return self._not_implemented_stub(
-            "correlation.list",
-            "CorrelationService.list is not attached in Phase 4.9",
+        svc = self._require_correlation_service()
+        body = request.body or {}
+        pattern_id = body.get("pattern_id")
+        since = body.get("since")
+        until = body.get("until")
+        limit = body.get("limit")
+        rows = svc.list(
+            pattern_id=pattern_id if isinstance(pattern_id, str) else None,
+            since=self._coerce_iso(since, "since"),
+            until=self._coerce_iso(until, "until"),
+            limit=limit if isinstance(limit, int) else None,
         )
+        return self._shape_ok({
+            "correlations": [c.to_dict() for c in rows],
+        })
 
     def _handle_correlation_get(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.CORRELATION_READ)
-        return self._not_implemented_stub(
-            "correlation.get",
-            "CorrelationService.get is not attached in Phase 4.9",
-        )
+        svc = self._require_correlation_service()
+        body = request.body or {}
+        cid = body.get("correlation_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="correlation_id required",
+                internal_detail="missing correlation_id",
+                field="correlation_id",
+            )
+        c = svc.get(cid)
+        return self._shape_ok({"correlation": c.to_dict()})
 
     def _handle_correlation_list_for_incident(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.CORRELATION_READ)
-        return self._not_implemented_stub(
-            "correlation.list_for_incident",
-            "CorrelationService.list_for_incident is not attached "
-            "in Phase 4.9",
+        svc = self._require_correlation_service()
+        body = request.body or {}
+        iid = body.get("incident_id")
+        if not isinstance(iid, str) or not iid:
+            raise InvalidProxyRequestError(
+                safe_message="incident_id required",
+                internal_detail="missing incident_id",
+                field="incident_id",
+            )
+        if self._incident_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="incident service unavailable",
+                internal_detail="proxy not wired",
+            )
+        case = self._incident_service.get_case(
+            identity=identity, incident_id=iid,
         )
+        # Combine normal + centralized correlation ids.
+        corr_ids = tuple(case.evidence.correlation_ids) + tuple(
+            case.centralized_correlation_ids
+        )
+        limit = body.get("limit")
+        rows = svc.list_for_incident(
+            incident_correlation_ids=corr_ids,
+            limit=limit if isinstance(limit, int) else None,
+        )
+        return self._shape_ok({
+            "correlations": [c.to_dict() for c in rows],
+        })
 
     def _handle_overview_summary(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.OVERVIEW_READ)
-        return self._not_implemented_stub(
-            "overview.summary",
-            "OverviewService.summary is not attached in Phase 4.9",
-        )
+        svc = self._require_overview_service()
+        summary = svc.summary(identity)
+        return self._shape_ok(summary)
 
     def _handle_timeline_build_for_incident(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.TIMELINE_READ)
-        return self._not_implemented_stub(
-            "timeline.build_for_incident",
-            "TimelineEngine.build_for_incident is not attached "
-            "in Phase 4.9",
+        svc = self._require_timeline_service()
+        body = request.body or {}
+        iid = body.get("incident_id")
+        if not isinstance(iid, str) or not iid:
+            raise InvalidProxyRequestError(
+                safe_message="incident_id required",
+                internal_detail="missing incident_id",
+                field="incident_id",
+            )
+        if self._incident_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="incident service unavailable",
+                internal_detail="proxy not wired",
+            )
+        case = self._incident_service.get_case(
+            identity=identity, incident_id=iid,
         )
+        result = svc.build_for_incident(case=case)
+        return self._shape_ok(result.to_dict())
 
     # ----- rule management (Phase 4.9 frontend)
     def _handle_rule_list(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.RULE_READ)
-        return self._not_implemented_stub(
-            "rule.list",
-            "RuleManagementService.list is not attached in Phase 4.9",
-        )
+        svc = self._require_rule_management_service()
+        body = request.body or {}
+        # The wire contract documents a simple ``rule.list`` with
+        # no required filter; the service exposes both
+        # ``list_all`` and ``list_latest``. By default we return
+        # the latest version of every rule (analyst-friendly).
+        latest_only = bool(body.get("latest_only", True))
+        if latest_only:
+            rules = svc.list_latest()
+        else:
+            rules = svc.list_all()
+        return self._shape_ok({
+            "rules": [r.to_canonical_dict() for r in rules],
+        })
 
     def _handle_rule_get(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.RULE_READ)
-        return self._not_implemented_stub(
-            "rule.get",
-            "RuleManagementService.get is not attached in Phase 4.9",
+        svc = self._require_rule_management_service()
+        body = request.body or {}
+        rid = body.get("rule_id")
+        if not isinstance(rid, str) or not rid:
+            raise InvalidProxyRequestError(
+                safe_message="rule_id required",
+                internal_detail="missing rule_id",
+                field="rule_id",
+            )
+        version = body.get("version")
+        if version is not None and not isinstance(version, int):
+            raise InvalidProxyRequestError(
+                safe_message="invalid version",
+                internal_detail=(
+                    f"version must be int, got {type(version).__name__}"
+                ),
+                field="version",
+            )
+        rule = svc.get(
+            rid,
+            version=version if isinstance(version, int) else None,
         )
+        if rule is None:
+            raise NotFoundError(
+                safe_message="rule not found",
+                internal_detail=(
+                    f"rule_id={rid!r} version={version!r}"
+                ),
+            )
+        return self._shape_ok({"rule": rule.to_canonical_dict()})
 
     def _handle_rule_create(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.RULE_WRITE)
-        return self._not_implemented_stub(
-            "rule.create",
-            "RuleManagementService.create is not attached in Phase 4.9",
-        )
+        svc = self._require_rule_management_service()
+        body = request.body or {}
+        if not isinstance(body, dict):
+            raise InvalidProxyRequestError(
+                safe_message="invalid body",
+                internal_detail="body must be an object",
+                field="body",
+            )
+        payload = dict(body)
+        if "rule_id" not in payload:
+            raise InvalidProxyRequestError(
+                safe_message="rule_id required",
+                internal_detail="missing rule_id in payload",
+                field="rule_id",
+            )
+        definition = svc.create(payload)
+        return self._shape_ok({"rule": definition.to_canonical_dict()})
 
     def _handle_rule_update(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.RULE_WRITE)
-        return self._not_implemented_stub(
-            "rule.update",
-            "RuleManagementService.update is not attached in Phase 4.9",
-        )
+        svc = self._require_rule_management_service()
+        body = request.body or {}
+        rid = body.get("rule_id")
+        version = body.get("version")
+        if not isinstance(rid, str) or not rid:
+            raise InvalidProxyRequestError(
+                safe_message="rule_id required",
+                internal_detail="missing rule_id",
+                field="rule_id",
+            )
+        if not isinstance(version, int):
+            raise InvalidProxyRequestError(
+                safe_message="version required",
+                internal_detail=(
+                    f"version must be int, got {type(version).__name__}"
+                ),
+                field="version",
+            )
+        payload = {
+            k: v for k, v in body.items()
+            if k not in ("rule_id", "version")
+        }
+        definition = svc.update(rid, version, payload)
+        return self._shape_ok({"rule": definition.to_canonical_dict()})
 
     def _handle_rule_version(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.RULE_WRITE)
-        return self._not_implemented_stub(
-            "rule.version",
-            "RuleManagementService.version is not attached in "
-            "Phase 4.9",
-        )
+        svc = self._require_rule_management_service()
+        body = request.body or {}
+        rid = body.get("rule_id")
+        if not isinstance(rid, str) or not rid:
+            raise InvalidProxyRequestError(
+                safe_message="rule_id required",
+                internal_detail="missing rule_id",
+                field="rule_id",
+            )
+        payload = {
+            k: v for k, v in body.items() if k != "rule_id"
+        }
+        definition = svc.create_new_version(rid, payload)
+        return self._shape_ok({"rule": definition.to_canonical_dict()})
 
     def _handle_rule_enable(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.RULE_WRITE)
-        return self._not_implemented_stub(
-            "rule.enable",
-            "RuleManagementService.enable is not attached in "
-            "Phase 4.9",
+        svc = self._require_rule_management_service()
+        body = request.body or {}
+        rid = body.get("rule_id")
+        version = body.get("version")
+        if not isinstance(rid, str) or not rid:
+            raise InvalidProxyRequestError(
+                safe_message="rule_id required",
+                internal_detail="missing rule_id",
+                field="rule_id",
+            )
+        definition = svc.set_enabled(
+            rid, True,
+            version=version if isinstance(version, int) else None,
         )
+        return self._shape_ok({"rule": definition.to_canonical_dict()})
 
     def _handle_rule_disable(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.RULE_WRITE)
-        return self._not_implemented_stub(
-            "rule.disable",
-            "RuleManagementService.disable is not attached in "
-            "Phase 4.9",
+        svc = self._require_rule_management_service()
+        body = request.body or {}
+        rid = body.get("rule_id")
+        version = body.get("version")
+        if not isinstance(rid, str) or not rid:
+            raise InvalidProxyRequestError(
+                safe_message="rule_id required",
+                internal_detail="missing rule_id",
+                field="rule_id",
+            )
+        definition = svc.set_enabled(
+            rid, False,
+            version=version if isinstance(version, int) else None,
         )
+        return self._shape_ok({"rule": definition.to_canonical_dict()})
 
     def _handle_rule_retire(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
         self._require(identity, Permission.RULE_WRITE)
-        return self._not_implemented_stub(
-            "rule.retire",
-            "RuleManagementService.retire is not attached in "
-            "Phase 4.9",
+        svc = self._require_rule_management_service()
+        body = request.body or {}
+        rid = body.get("rule_id")
+        version = body.get("version")
+        if not isinstance(rid, str) or not rid:
+            raise InvalidProxyRequestError(
+                safe_message="rule_id required",
+                internal_detail="missing rule_id",
+                field="rule_id",
+            )
+        definition = svc.set_state(
+            rid, "retired",
+            version=version if isinstance(version, int) else None,
         )
+        return self._shape_ok({"rule": definition.to_canonical_dict()})
 
     def _handle_report_export(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
+        """``report.export`` Phase 4.10.
+
+        The wire contract documents a JSON-serialised export
+        built from the report payload returned by ``report.get``.
+        We do NOT implement a binary PDF / CSV / text encoder
+        here (the contract documents the JSON format and notes
+        that the frontend can serialize other formats
+        client-side). Future slices can add binary export via
+        a ``ReportExporter`` service; the security boundary is
+        unaffected because the report payload already
+        redacts secrets.
+        """
         self._require(identity, Permission.REPORT_READ)
-        return self._not_implemented_stub(
-            "report.export",
-            "ReportService.export is not attached in Phase 4.9",
+        if self._report_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="report service unavailable",
+                internal_detail="proxy not wired",
+            )
+        body = request.body or {}
+        rid = body.get("report_id")
+        fmt = body.get("format", "json")
+        if not isinstance(rid, str) or not rid:
+            raise InvalidProxyRequestError(
+                safe_message="report_id required",
+                internal_detail="missing report_id",
+                field="report_id",
+            )
+        if not isinstance(fmt, str) or fmt != "json":
+            raise InvalidProxyRequestError(
+                safe_message=(
+                    "unsupported export format; only 'json' is "
+                    "supported in Phase 4.10"
+                ),
+                internal_detail=f"format={fmt!r}",
+                field="format",
+            )
+        report: Report = self._report_service.get_report(
+            identity=identity, report_id=rid,
         )
+        return self._shape_ok({
+            "report_id": report.report_id,
+            "format": fmt,
+            "payload": report.to_dict(),
+        })
 
 
 # ----------------------------------------------------------------- payload helpers

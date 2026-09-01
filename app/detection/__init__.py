@@ -50,6 +50,7 @@ from .errors import (
 )
 from .models import Detection, DetectionResult
 from .pipeline import DetectionPipeline, PipelineResult
+from .service import DetectionReadService
 
 __all__ = [
     "Detection",
@@ -58,6 +59,7 @@ __all__ = [
     "DetectionError",
     "DetectionIdGenerationError",
     "DetectionPipeline",
+    "DetectionReadService",
     "DetectionResult",
     "InvalidEventError",
     "NoRuleRegistryError",
