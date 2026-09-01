@@ -332,9 +332,21 @@ class TestUnrelatedIsolation:
 
 class TestReplay:
     def test_duplicate_detections_do_not_double_count_id(self) -> None:
+        """CORRELATION-01 regression.
+
+        A single event that triggers two rules (e.g.
+        NGINX-AUTH-FAILURE-001 + NGINX-AUTH-BRUTEFORCE-001)
+        must NOT inflate the correlation ``count``. The
+        reported ``count`` is the number of distinct
+        auth-failure events in the window, NOT the number
+        of detection rows.
+        """
         start = FIXED_NOW
         events, detections = make_burst(n=4, start=start)
         events_by_id = {e.event_id: e for e in events}
+        # A duplicate detection for the first event (same
+        # event_id, different rule) simulates two rules
+        # firing on a single event.
         dup = _det(
             event_id=events[0].event_id,
             rule_id="NGINX-AUTH-FAILURE-001",
@@ -350,7 +362,14 @@ class TestReplay:
             now=FIXED_NOW,
         )
         assert result.correlation_count == 1
-        assert result.correlations[0].count == 5
+        # ``count`` is the distinct event count (4), not the
+        # detection row count (5). The duplicate detection
+        # is preserved in ``detection_ids`` so an analyst
+        # can still see both rule firings.
+        assert result.correlations[0].count == 4
+        # The detection_count extra captures the row count.
+        extra = dict(result.correlations[0].extra)
+        assert extra.get("detection_count") == 5
 
     def test_replay_yields_deterministic_id(self) -> None:
         start = FIXED_NOW

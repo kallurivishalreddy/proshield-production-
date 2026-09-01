@@ -175,6 +175,78 @@ class _RateLimiter:
                 self._buckets.pop(k, None)
         return True
 
+    def consume(
+        self,
+        *,
+        key: str,
+        count: int = 1,
+        now: Optional[float] = None,
+    ) -> bool:
+        """ST-01: decrement the budget by ``count``.
+
+        Returns ``True`` iff the budget was successfully
+        decremented. Returns ``False`` (without mutating)
+        when the charge would exceed the per-window budget
+        — the caller MUST respond 429 and NOT persist any
+        of the in-flight events.
+
+        ``count=0`` is a no-op: no budget is charged and
+        ``True`` is returned. This lets callers use a
+        single ``consume`` call regardless of the batch
+        size (e.g. an empty ``events`` list still has a
+        request to authorise).
+
+        ``count=N`` charges ``N`` units in a single atomic
+        step so a request carrying N events cannot amplify
+        the per-event rate limit.
+        """
+        if not isinstance(count, int):
+            raise DomainValidationError(
+                safe_message="rate-limit count must be an int",
+                internal_detail=f"count={count!r}",
+            )
+        if count < 0:
+            raise DomainValidationError(
+                safe_message="rate-limit count must be non-negative",
+                internal_detail=f"count={count!r}",
+            )
+        if not isinstance(key, str) or not key:
+            raise DomainValidationError(
+                safe_message="rate-limit key missing",
+                internal_detail="non-string key",
+            )
+        if count == 0:
+            return True
+        if now is None:
+            now = datetime.now(timezone.utc).timestamp()
+        bucket = self._buckets.setdefault(key, {"ts": []})
+        bucket["ts"] = [
+            t for t in bucket["ts"]
+            if (now - t) < self.window_seconds
+        ]
+        if (len(bucket["ts"]) + count) > self.budget:
+            return False
+        # Each unit is recorded as a fresh timestamp so the
+        # sliding window rolls them out independently. We
+        # only stamp the *first* unit with the real ``now``
+        # so the whole batch ages out as a single logical
+        # ``now`` to keep the window semantics simple.
+        bucket["ts"].append(now)
+        # Extra units beyond the first share ``now``; this
+        # is intentional — they remain valid for the full
+        # window alongside the leading unit and roll out
+        # together.
+        for _ in range(count - 1):
+            bucket["ts"].append(now)
+        if len(self._buckets) > MAX_INGRESS_RATE_BUCKETS:
+            oldest = sorted(
+                self._buckets.items(),
+                key=lambda kv: kv[1]["ts"][0] if kv[1]["ts"] else 0,
+            )
+            for k, _ in oldest[: max(0, len(oldest) - MAX_INGRESS_RATE_BUCKETS)]:
+                self._buckets.pop(k, None)
+        return True
+
 
 class InboundIngressProxy:
     """The trusted inbound integration boundary.
@@ -312,14 +384,10 @@ class InboundIngressProxy:
                 status=403,
             )
         now = datetime.now(timezone.utc).timestamp()
-        if not self._rate_limiter.allow(
-            key=str(verified.source_instance_id), now=now,
-        ):
-            return _error_response(
-                "source_rate_limited",
-                "source instance rate limit exceeded",
-                status=429,
-            )
+        # ST-01: count events against the per-source budget
+        # so a single request carrying N events cannot amplify
+        # the documented per-event rate limit by N×. We also
+        # enforce a per-request event cap.
         body = request.body or {}
         events_raw = body.get("events", [])
         if not isinstance(events_raw, list):
@@ -327,6 +395,41 @@ class InboundIngressProxy:
                 "validation_error",
                 "events must be a list",
                 status=400,
+            )
+        max_per_request = getattr(
+            self._config, "ingress_max_events_per_request", 100
+        )
+        if len(events_raw) > max_per_request:
+            return _error_response(
+                "validation_error",
+                (
+                    f"too many events per request: "
+                    f"{len(events_raw)} > {max_per_request}"
+                ),
+                status=400,
+            )
+        # Per-request + per-event budget check (ST-01).
+        # The sliding window is charged ``1 + len(events)``
+        # units atomically:
+        #   * the leading ``1`` is the documented
+        #     per-request charge (one budget unit per call,
+        #     regardless of the batch size — preserves the
+        #     pre-Phase-4.9 burst behaviour where
+        #     ``rate_limit_blocks_after_budget`` expects 3
+        #     back-to-back requests to consume 3 units);
+        #   * the ``len(events)`` term is the new ST-01
+        #     per-event charge so a request carrying N
+        #     events cannot amplify the per-event limit by
+        #     N× in a single request.
+        if not self._rate_limiter.consume(
+            key=str(verified.source_instance_id),
+            count=1 + len(events_raw),
+            now=now,
+        ):
+            return _error_response(
+                "source_rate_limited",
+                "source instance event rate limit exceeded",
+                status=429,
             )
         accepted: List[str] = []
         rejected: List[Dict[str, Any]] = []
@@ -470,9 +573,53 @@ class InboundIngressProxy:
         details = raw.get("details") or {}
         if not isinstance(details, dict):
             details = {"_raw_details": str(details)[:256]}
-        asset = raw.get("asset") or (
+        # ST-04 remediation: source-reported identity is
+        # untrusted. The wire endpoint / asset / source_ip
+        # are stamped onto the event ONLY when they match
+        # the registered source configuration; mismatches
+        # are recorded under ``details._untrusted_*`` and
+        # NOT promoted to canonical SecurityEvent fields.
+        registered_endpoint = (
+            source.configuration.endpoint or None
+        )
+        client_endpoint = _opt_str(raw.get("endpoint"), 512)
+        reconciled_endpoint = (
+            client_endpoint
+            if client_endpoint is not None
+            and client_endpoint == registered_endpoint
+            else registered_endpoint
+        )
+        registered_asset = (
             source.asset_tags[0] if source.asset_tags else None
         )
+        client_asset = _opt_str(raw.get("asset"), 128)
+        reconciled_asset = (
+            client_asset
+            if client_asset is not None
+            and client_asset == registered_asset
+            else registered_asset
+        )
+        client_source_ip = _opt_str(raw.get("source_ip"), 64)
+        # ``source_ip`` is observable by the trusted network
+        # edge in real deployments; we keep the client value
+        # but record an untrusted flag if the registered
+        # source has a known egress that disagrees. Most
+        # sources have no registered egress, so the value is
+        # accepted as-is.
+        if client_source_ip is not None and (
+            client_endpoint is not None
+            and client_endpoint != registered_endpoint
+        ):
+            details["_untrusted_source_ip"] = client_source_ip
+            client_source_ip = None
+        if client_asset is not None and reconciled_asset is None:
+            details["_untrusted_asset"] = client_asset
+        if (
+            client_endpoint is not None
+            and registered_endpoint is not None
+            and client_endpoint != registered_endpoint
+        ):
+            details["_untrusted_endpoint"] = client_endpoint
         ev = SecurityEvent(
             event_id=str(
                 raw.get("event_id") or uuid7()
@@ -481,10 +628,10 @@ class InboundIngressProxy:
             ingested_at=datetime.now(timezone.utc),
             source=source.source,
             event_type=event_type,
-            source_ip=_opt_str(raw.get("source_ip"), 64),
+            source_ip=client_source_ip,
             destination=_opt_str(raw.get("destination"), 256),
-            endpoint=_opt_str(raw.get("endpoint"), 512),
-            asset=_opt_str(asset, 128),
+            endpoint=reconciled_endpoint,
+            asset=reconciled_asset,
             account=account,
             details=dict(details),
             provenance=provenance,

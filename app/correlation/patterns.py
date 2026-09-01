@@ -350,16 +350,24 @@ class BruteForceClusteringPattern(CorrelationPattern):
         for (source_ip, endpoint_key), (full_endpoint, group_dets) in groups.items():
             sorted_dets = sorted(group_dets, key=lambda x: x.detected_at)
             n = len(sorted_dets)
-            if n < self.threshold:
+            # CORRELATION-01: count DISTINCT events, not
+            # detection rows. A single failed-login event may
+            # trigger multiple rules (e.g. BRUTEFORCE-001 +
+            # ACCOUNT-LOCKOUT-001) and would otherwise be
+            # double-counted. The reported ``count`` is the
+            # number of unique auth-failure events.
+            distinct_event_ids: List[str] = list(
+                dict.fromkeys(d.event_id for d in sorted_dets)
+            )
+            distinct_count = len(distinct_event_ids)
+            if distinct_count < self.threshold:
                 continue
             earliest = sorted_dets[0].detected_at
             latest = sorted_dets[-1].detected_at
             if (latest - earliest) > self.window:
                 continue
             det_ids = tuple(sorted(d.detection_id for d in sorted_dets))
-            ev_ids = tuple(
-                dict.fromkeys(d.event_id for d in sorted_dets)
-            )
+            ev_ids = tuple(distinct_event_ids)
             trigger = validate_trigger(self.trigger)
             correlation_id = _build_correlation_id(
                 pattern_id=self.pattern_id,
@@ -380,11 +388,11 @@ class BruteForceClusteringPattern(CorrelationPattern):
                 event_ids=ev_ids,
                 window_start=earliest,
                 window_end=latest,
-                count=len(sorted_dets),
+                count=distinct_count,
                 reasoning=self._build_reasoning(
                     source_ip=source_ip,
                     endpoint=full_endpoint,
-                    count=len(sorted_dets),
+                    count=distinct_count,
                     threshold=self.threshold,
                     window_seconds=int(self.window.total_seconds()),
                 ),
@@ -392,6 +400,7 @@ class BruteForceClusteringPattern(CorrelationPattern):
                 extra=(
                     ("threshold", self.threshold),
                     ("window_seconds", int(self.window.total_seconds())),
+                    ("detection_count", n),
                 ),
             )
             out.append(correlation)

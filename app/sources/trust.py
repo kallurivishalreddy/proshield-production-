@@ -265,6 +265,7 @@ class SourceIdentityTokenVerifier:
     max_lifetime_seconds: int = 3600
     replay_store: Any = None
     source_resolver: Any = None
+    replay_store_required: bool = True
 
     @classmethod
     def from_secret(
@@ -275,10 +276,23 @@ class SourceIdentityTokenVerifier:
         replay_store: Any = None,
         source_resolver: Any = None,
         key_id: str = "k1",
+        require_replay_store: bool = True,
     ) -> "SourceIdentityTokenVerifier":
-        """Build a verifier from a single shared secret (legacy path)."""
+        """Build a verifier from a single shared secret.
+
+        ST-02 fail-closed gate: ``require_replay_store``
+        (default ``True``) refuses to construct without a
+        non-``None`` ``replay_store``. Legacy in-memory
+        tests can opt out by passing
+        ``require_replay_store=False``.
+        """
         if not isinstance(secret, str) or not secret:
             raise ValueError("secret must be a non-empty str")
+        if require_replay_store and replay_store is None:
+            raise ValueError(
+                "replay_store is required (ST-02 fail-closed); "
+                "pass require_replay_store=False to bypass"
+            )
         keyring = SourceIdentityTokenKeyring(
             keys={key_id: secret}, active_key_id=key_id,
         )
@@ -287,6 +301,7 @@ class SourceIdentityTokenVerifier:
             max_lifetime_seconds=max_lifetime_seconds,
             replay_store=replay_store,
             source_resolver=source_resolver,
+            replay_store_required=require_replay_store,
         )
 
     def verify(
@@ -443,6 +458,21 @@ class SourceIdentityTokenVerifier:
                 )
         # R-1: replay protection. The first use is accepted; any
         # subsequent use of the same token_id is rejected.
+        # ST-02 fail-closed: when ``replay_store_required`` is
+        # True (the production default) the verifier rejects
+        # ANY token when no replay_store is wired — the
+        # documented single-use guarantee is silent-by-default
+        # otherwise.
+        if self.replay_store_required and self.replay_store is None:
+            raise SourceIdentityTokenError(
+                safe_message=(
+                    "source identity token replay store missing"
+                ),
+                internal_detail=(
+                    "replay_store_required is True but no "
+                    "replay_store was wired"
+                ),
+            )
         if self.replay_store is not None:
             accepted = self.replay_store.claim(
                 token_id=token.token_id,

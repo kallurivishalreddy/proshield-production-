@@ -143,10 +143,39 @@ def main() -> int:
             registry=source_registry,
             token_issuer=token_issuer,
         )
+        # ST-02: wire an in-memory replay store for the demo.
+        # In production this MUST be MongoDB / Redis so the
+        # single-use guarantee holds across processes.
+        from datetime import datetime as _DemoDT
+        from threading import Lock as _DemoLock
+        from typing import Dict as _DemoDict
+        class _DemoReplayStore:
+            def __init__(self):
+                self._used: _DemoDict[str, _DemoDT] = {}
+                self._lock = _DemoLock()
+            def claim(self, *, token_id, expires_at):
+                with self._lock:
+                    if token_id in self._used:
+                        return False
+                    self._used[token_id] = expires_at
+                    return True
+            def release(self, token_id):
+                with self._lock:
+                    self._used.pop(token_id, None)
+            def gc(self, now):
+                with self._lock:
+                    expired = [
+                        tid for tid, exp in self._used.items()
+                        if exp <= now
+                    ]
+                    for tid in expired:
+                        del self._used[tid]
+                    return len(expired)
         token_verifier = SourceIdentityTokenVerifier.from_secret(
             config.source_signing_key,
             max_lifetime_seconds=3600,
             source_resolver=lambda sid: source_repo.get(sid),
+            replay_store=_DemoReplayStore(),
         )
         ingestion_service = SecurityEventIngestionService(
             security_event_repo, config,

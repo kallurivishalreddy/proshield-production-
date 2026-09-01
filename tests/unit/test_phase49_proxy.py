@@ -60,6 +60,7 @@ def _config() -> ProShieldConfig:
 
 
 def _identity_store() -> InMemoryIdentityStore:
+    # AUTH-001 remediation: explicit credentials.
     return InMemoryIdentityStore({
         "user-analyst-001": Identity(
             subject_id="user-analyst-001", role=ANALYST_ROLE,
@@ -67,13 +68,21 @@ def _identity_store() -> InMemoryIdentityStore:
         "user-admin-001": Identity(
             subject_id="user-admin-001", role=ADMIN_ROLE,
         ),
+    }, credentials={
+        "user-analyst-001": "analyst-password",
+        "user-admin-001": "admin-password",
     })
 
 
 def _token(proxy: SecureProxy, subject_id: str) -> str:
+    # AUTH-001 remediation: ``auth.issue`` requires credential.
+    password = {
+        "user-analyst-001": "analyst-password",
+        "user-admin-001": "admin-password",
+    }[subject_id]
     return proxy.handle(ProxyRequest(
         operation=OP_AUTH_ISSUE, headers={},
-        body={"subject_id": subject_id},
+        body={"subject_id": subject_id, "credential": password},
     )).body["data"]["token"]
 
 

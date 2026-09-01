@@ -56,15 +56,50 @@ class TestIdentity:
 
 class TestIdentityStore:
     def test_default_catalogue(self) -> None:
+        # AUTH-001 remediation: the default catalogue is
+        # intentionally empty so misconfigured deployments
+        # fail closed. Tests / demos must inject explicit
+        # identities (and credentials) — see the proxy
+        # test fixtures.
         store = InMemoryIdentityStore()
-        assert "user-analyst-001" in store
-        assert "user-admin-001" in store
+        assert store.all_subject_ids() == ()
 
     def test_get_returns_none_for_unknown(self) -> None:
         store = InMemoryIdentityStore()
         assert store.get("missing") is None
         assert store.get("") is None
         assert store.get(None) is None  # type: ignore[arg-type]
+
+    def test_verify_credential_matches(self) -> None:
+        from app.auth import ANALYST_ROLE
+        store = InMemoryIdentityStore(
+            identities={
+                    "user-analyst-001": Identity(
+                        subject_id="user-analyst-001",
+                        role=ANALYST_ROLE,
+                    ),
+                },
+            credentials={"user-analyst-001": "secret-123"},
+        )
+        assert store.verify_credential(
+            "user-analyst-001", "secret-123"
+        ) is True
+        assert store.verify_credential(
+            "user-analyst-001", "wrong"
+        ) is False
+        assert store.verify_credential("ghost", "secret-123") is False
+        assert store.verify_credential("", "secret-123") is False
+        assert store.verify_credential(
+            "user-analyst-001", ""
+        ) is False
+
+    def test_identity_store_base_class_raises(self) -> None:
+        from app.auth.identity import IdentityStore
+        # Base IdentityStore requires concrete implementations
+        # to opt-in to credential verification.
+        base = IdentityStore()
+        with pytest.raises(NotImplementedError):
+            base.verify_credential("x", "y")
 
 
 class TestPermissions:

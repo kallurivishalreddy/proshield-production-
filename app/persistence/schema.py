@@ -26,6 +26,14 @@ SECURITY_EVENTS_VALIDATOR: Dict[str, Any] = {
             "provenance",
             "schema_version",
         ],
+        # PIPELINE-02: forbid unknown top-level fields.
+        # The application has its own Pydantic model that
+        # rejects unexpected keys; this is the
+        # defense-in-depth gate at the database. MongoDB
+        # does NOT validate ``_id`` against this block, so
+        # ``_id`` is explicitly listed under ``properties``
+        # to keep the rest of the document closed.
+        "additionalProperties": False,
         # MongoDB always adds an ``_id`` field.  We explicitly allow it
         # here and rely on the ``properties`` block to forbid any other
         # unexpected keys.  We do not validate ``_id`` here because

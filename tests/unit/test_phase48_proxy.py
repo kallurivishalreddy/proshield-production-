@@ -26,6 +26,7 @@ def _config(rate=10000, centralized=10):
         mongo_db="proshield_test",
         mongo_collection_events="security_events",
         auth_signing_key=new_development_signing_key(),
+        source_signing_key=new_development_signing_key(),
         auth_token_lifetime_seconds=3600,
         proxy_rate_limit_per_minute=rate,
         proxy_max_request_bytes=MAX_PROXY_REQUEST_BYTES,
@@ -34,10 +35,18 @@ def _config(rate=10000, centralized=10):
         ingest_max_body_bytes=16_384,
         ingest_max_details_bytes=8_192,
         ingest_rate_limit_per_minute=600,
+        # ST-02: explicit replay store is wired at startup;
+        # ``development`` / ``test`` env_names keep the
+        # empty-key fallback (see config post_init).
+        ingress_replay_store_required=False,
     )
 
 
 def _identity_store():
+    # AUTH-001 remediation: tests inject explicit credentials
+    # so the proxy's credential-verifying ``auth.issue`` can
+    # succeed. Production / deployments must do the same via
+    # ``PROSHIELD_DEFAULT_SUBJECT_CREDENTIALS``.
     return InMemoryIdentityStore({
         "user-analyst-001": Identity(
             subject_id="user-analyst-001", role=ANALYST_ROLE,
@@ -45,6 +54,9 @@ def _identity_store():
         "user-admin-001": Identity(
             subject_id="user-admin-001", role=ADMIN_ROLE,
         ),
+    }, credentials={
+        "user-analyst-001": "analyst-password",
+        "user-admin-001": "admin-password",
     })
 
 
@@ -56,9 +68,24 @@ def _proxy(config=None):
 
 
 def _token(proxy, subject_id):
+    # AUTH-001 remediation: ``auth.issue`` now requires a
+    # credential. Tests supply the password that the test
+    # identity store was constructed with. For ad-hoc
+    # subjects (collector / internal_service / user-analyst-002
+    # added by individual tests), the password matches the
+    # one written into ``store._credentials`` immediately
+    # before this call.
+    store = proxy.identity_store
+    if subject_id in store._credentials:
+        password = store._credentials[subject_id]
+    else:
+        password = {
+            "user-analyst-001": "analyst-password",
+            "user-admin-001": "admin-password",
+        }.get(subject_id, subject_id)
     return proxy.handle(ProxyRequest(
         operation=OP_AUTH_ISSUE, headers={},
-        body={"subject_id": subject_id},
+        body={"subject_id": subject_id, "credential": password},
     )).body["data"]["token"]
 
 
@@ -122,7 +149,10 @@ class TestAuthIssue:
         proxy = _proxy()
         resp = proxy.handle(ProxyRequest(
             operation=OP_AUTH_ISSUE, headers={},
-            body={"subject_id": "user-analyst-001"},
+            body={
+                "subject_id": "user-analyst-001",
+                "credential": "analyst-password",
+            },
         ))
         assert resp.status == 200
 
@@ -130,7 +160,7 @@ class TestAuthIssue:
         proxy = _proxy()
         resp = proxy.handle(ProxyRequest(
             operation=OP_AUTH_ISSUE, headers={},
-            body={"subject_id": "ghost"},
+            body={"subject_id": "ghost", "credential": "x"},
         ))
         assert resp.status == 401
 
@@ -140,6 +170,39 @@ class TestAuthIssue:
             operation=OP_AUTH_ISSUE, headers={}, body={},
         ))
         assert resp.status == 400
+
+    def test_issue_token_requires_credential(self):
+        """AUTH-001: a missing credential is rejected 401."""
+        proxy = _proxy()
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_AUTH_ISSUE, headers={},
+            body={"subject_id": "user-analyst-001"},
+        ))
+        assert resp.status == 401
+        assert "credential" in resp.body["error"]["message"].lower()
+
+    def test_issue_token_rejects_bad_credential(self):
+        """AUTH-001: an invalid credential is rejected 401."""
+        proxy = _proxy()
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_AUTH_ISSUE, headers={},
+            body={
+                "subject_id": "user-analyst-001",
+                "credential": "wrong-password",
+            },
+        ))
+        assert resp.status == 401
+
+    def test_issue_token_accepts_credential_header(self):
+        """AUTH-001: credential can be supplied via header too."""
+        from app.proxy.proxy import PROXY_HEADER_CREDENTIAL
+        proxy = _proxy()
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_AUTH_ISSUE,
+            headers={PROXY_HEADER_CREDENTIAL: "analyst-password"},
+            body={"subject_id": "user-analyst-001"},
+        ))
+        assert resp.status == 200
 
 
 class TestSafeErrorEnvelope:
@@ -184,6 +247,7 @@ class TestAuthorizationRules:
         proxy = _proxy()
         store = proxy.identity_store
         store._identities["user-coll-001"] = Identity(subject_id="user-coll-001", role="collector")
+        store._credentials["user-coll-001"] = "collector-password"
         tok = _token(proxy, "user-coll-001")
         resp = proxy.handle(ProxyRequest(operation=OP_GET_CASE, headers={PROXY_HEADER_AUTHORIZATION: chr(66) + chr(101) + chr(97) + chr(114) + chr(101) + chr(114) + chr(32) + tok}, body={"incident_id": "x"}))
         assert resp.status == 403
@@ -192,6 +256,7 @@ class TestAuthorizationRules:
         proxy = _proxy()
         store = proxy.identity_store
         store._identities["user-coll-001"] = Identity(subject_id="user-coll-001", role="collector")
+        store._credentials["user-coll-001"] = "collector-password"
         tok = _token(proxy, "user-coll-001")
         resp = proxy.handle(ProxyRequest(operation=OP_REQUEST_CENTRALIZED, headers={PROXY_HEADER_AUTHORIZATION: chr(66) + chr(101) + chr(97) + chr(114) + chr(101) + chr(114) + chr(32) + tok}, body={"incident_id": "x"}))
         assert resp.status == 403
@@ -300,6 +365,9 @@ class TestReportIdorThroughProxy:
         proxy.identity_store._identities["user-analyst-002"] = Identity(
             subject_id="user-analyst-002", role=ANALYST_ROLE,
         )
+        proxy.identity_store._credentials["user-analyst-002"] = (
+            "analyst-002-password"
+        )
         tok = _token(proxy, "user-analyst-002")
         resp = proxy.handle(ProxyRequest(
             operation="report.get",
@@ -398,6 +466,7 @@ class TestInternalServicesHidden:
         proxy = _proxy()
         store = proxy.identity_store
         store._identities["svc-001"] = Identity(subject_id="svc-001", role="internal_service")
+        store._credentials["svc-001"] = "svc-password"
         tok = _token(proxy, "svc-001")
         resp = proxy.handle(ProxyRequest(operation=OP_GENERATE_NORMAL_REPORT, headers={PROXY_HEADER_AUTHORIZATION: chr(66) + chr(101) + chr(97) + chr(114) + chr(101) + chr(114) + chr(32) + tok}, body={"incident_id": "x"}))
         assert resp.status == 403
@@ -406,6 +475,7 @@ class TestInternalServicesHidden:
         proxy = _proxy()
         store = proxy.identity_store
         store._identities["svc-001"] = Identity(subject_id="svc-001", role="internal_service")
+        store._credentials["svc-001"] = "svc-password"
         tok = _token(proxy, "svc-001")
         resp = proxy.handle(ProxyRequest(operation=OP_ROUTE_CASE, headers={PROXY_HEADER_AUTHORIZATION: chr(66) + chr(101) + chr(97) + chr(114) + chr(101) + chr(114) + chr(32) + tok}, body={"incident_id": "x"}))
         assert resp.status in (400, 403)

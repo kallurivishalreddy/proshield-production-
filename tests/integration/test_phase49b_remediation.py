@@ -6,8 +6,9 @@
 """
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Dict
 
 import pytest
 from pydantic import ValidationError
@@ -44,6 +45,39 @@ from app.domain.security_event import (
     SecurityEvent,
     SecurityEventProvenance,
 )
+
+
+class _InMemoryReplayStore:
+    """R-1 test double: server-side single-use token store.
+
+    Phase 4.9 ST-02 makes replay-store wiring mandatory at
+    verifier construction; the in-memory implementation is
+    sufficient for integration tests against MongoDB.
+    """
+
+    def __init__(self) -> None:
+        self._used: Dict[str, datetime] = {}
+        self._lock = threading.Lock()
+
+    def claim(self, *, token_id, expires_at):
+        with self._lock:
+            if token_id in self._used:
+                return False
+            self._used[token_id] = expires_at
+            return True
+
+    def release(self, token_id):
+        with self._lock:
+            self._used.pop(token_id, None)
+
+    def gc(self, now):
+        with self._lock:
+            expired = [
+                tid for tid, exp in self._used.items() if exp <= now
+            ]
+            for tid in expired:
+                del self._used[tid]
+            return len(expired)
 
 
 TEST_DB_NAME = "proshield_test_phase49b"
@@ -135,10 +169,14 @@ class TestD3MultiProcessStateConsistency:
             secret=cfg.source_signing_key, lifetime_seconds=3600,
         )
         ingestion = SecurityEventIngestionService(sec_repo, cfg)
+        # ST-02 fail-closed: a fresh in-memory replay store is
+        # created per proxy so tokens can be replay-claimed.
+        replay_store = _InMemoryReplayStore()
         verifier = SourceIdentityTokenVerifier.from_secret(
             cfg.source_signing_key,
             max_lifetime_seconds=3600,
             source_resolver=lambda sid: src_repo.get(sid),
+            replay_store=replay_store,
         )
         return InboundIngressProxy(
             config=cfg,
@@ -215,8 +253,15 @@ class TestD3MultiProcessStateConsistency:
         svc_a.retire(
             identity=_admin(), source_instance_id=sid,
         )
+        # R-1 single-use: re-issue a fresh token, not reuse
+        # ``packed`` (already claimed by ingress_b's replay
+        # store).
+        packed_2 = issuer.pack(issuer.issue(
+            source_instance_id=SourceInstanceId(sid),
+            source_type=SourceType.NGINX,
+        ))
         r2 = self._ingest(
-            ingress_b, packed,
+            ingress_b, packed_2,
             "0198c2a1-7e3b-7a8e-b7b6-4f6a7d4d5fb2",
         )
         assert r2.status == 410

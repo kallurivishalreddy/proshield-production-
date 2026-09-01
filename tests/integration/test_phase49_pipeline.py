@@ -5,8 +5,11 @@ Reference: docs/PHASE 4/PHASE-04-09-REPORT.md.
 from __future__ import annotations
 
 import sys
+import threading
 import uuid
+from datetime import datetime
 from pathlib import Path
+from typing import Dict
 
 import pytest
 
@@ -70,6 +73,39 @@ from app.rules import RuleRegistry, load_rules_from_specs
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+
+
+class _InMemoryReplayStore:
+    """R-1 test double: server-side single-use token store.
+
+    Phase 4.9 ST-02 makes replay-store wiring mandatory at
+    verifier construction; this in-memory implementation is
+    sufficient for integration tests against MongoDB.
+    """
+
+    def __init__(self) -> None:
+        self._used: Dict[str, datetime] = {}
+        self._lock = threading.Lock()
+
+    def claim(self, *, token_id, expires_at):
+        with self._lock:
+            if token_id in self._used:
+                return False
+            self._used[token_id] = expires_at
+            return True
+
+    def release(self, token_id):
+        with self._lock:
+            self._used.pop(token_id, None)
+
+    def gc(self, now):
+        with self._lock:
+            expired = [
+                tid for tid, exp in self._used.items() if exp <= now
+            ]
+            for tid in expired:
+                del self._used[tid]
+            return len(expired)
 
 
 TEST_DB_NAME = "proshield_test_phase49"
@@ -291,7 +327,7 @@ class TestIngressWithPersistedSource:
         )
         svc.enable(identity=_admin(), source_instance_id=sid)
 
-        verifier = SourceIdentityTokenVerifier.from_secret(issuer.secret, max_lifetime_seconds=3600, source_resolver=lambda sid: source_repo.get(sid))
+        verifier = SourceIdentityTokenVerifier.from_secret(issuer.secret, max_lifetime_seconds=3600, source_resolver=lambda sid: source_repo.get(sid), replay_store=_InMemoryReplayStore())
         ingestion = SecurityEventIngestionService(
             security_event_repo, test_config,
         )
@@ -363,7 +399,7 @@ class TestIngressWithPersistedSource:
         svc.enable(identity=_admin(), source_instance_id=sid)
         svc.retire(identity=_admin(), source_instance_id=sid)
 
-        verifier = SourceIdentityTokenVerifier.from_secret(issuer.secret, max_lifetime_seconds=3600, source_resolver=lambda sid: source_repo.get(sid))
+        verifier = SourceIdentityTokenVerifier.from_secret(issuer.secret, max_lifetime_seconds=3600, source_resolver=lambda sid: source_repo.get(sid), replay_store=_InMemoryReplayStore())
         ingestion = SecurityEventIngestionService(
             security_event_repo, test_config,
         )
@@ -414,7 +450,7 @@ class TestSourceProvenancePersistsAcrossPhase448:
         )
         svc.enable(identity=_admin(), source_instance_id=sid)
 
-        verifier = SourceIdentityTokenVerifier.from_secret(issuer.secret, max_lifetime_seconds=3600, source_resolver=lambda sid: source_repo.get(sid))
+        verifier = SourceIdentityTokenVerifier.from_secret(issuer.secret, max_lifetime_seconds=3600, source_resolver=lambda sid: source_repo.get(sid), replay_store=_InMemoryReplayStore())
         ingestion = SecurityEventIngestionService(
             security_event_repo, test_config,
         )
@@ -583,7 +619,7 @@ class TestSourceEndToEndThroughProxy:
         ))
         assert resp.status == 200
         packed = resp.body["data"]["source_token"]
-        verifier = SourceIdentityTokenVerifier.from_secret(test_config.source_signing_key, max_lifetime_seconds=3600)
+        verifier = SourceIdentityTokenVerifier.from_secret(test_config.source_signing_key, max_lifetime_seconds=3600, replay_store=_InMemoryReplayStore())
         token = verifier.verify(packed)
         assert token.source_instance_id == sid
 

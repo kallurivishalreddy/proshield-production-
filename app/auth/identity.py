@@ -14,11 +14,20 @@ The Phase 4.8 identity layer is intentionally tiny:
 * :class:`InMemoryIdentityStore` - the deterministic,
   in-memory implementation used by the Phase 4.8 slice.
 
-The identity layer does NOT store credentials, tokens, or
-signing material. It is read-only.
+AUTH-001 remediation: the identity store now also carries
+a credential map (``{subject_id: shared_secret}``) used by
+the credential-verifying ``auth.issue`` flow. Tests inject
+explicit credentials; production deployments wire them
+through ``PROSHIELD_DEFAULT_SUBJECT_CREDENTIALS``. The
+default empty catalogue forces every test / deployment to
+inject credentials; no default password is ever hard-coded.
+
+The identity layer does NOT store tokens or signing
+material. It is read-only.
 """
 from __future__ import annotations
 
+import hmac as _hmac
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Optional, Tuple
@@ -111,32 +120,36 @@ class IdentityStore:
     def get(self, subject_id: str) -> Optional[Identity]:
         raise NotImplementedError
 
+    def verify_credential(
+        self, subject_id: str, credential: str,
+    ) -> bool:
+        """AUTH-001: verify a presented credential against the
+        identity store. Returns ``True`` iff the credential
+        matches the one registered for ``subject_id``. The
+        base class default raises :class:`NotImplementedError`
+        so every concrete store must opt-in to credential
+        verification.
+        """
+        raise NotImplementedError
+
 
 class InMemoryIdentityStore(IdentityStore):
     """Deterministic, in-memory identity catalogue.
 
     Constructed with an explicit ``identities`` mapping so
-    tests can inject a known catalogue. A default catalogue
-    containing one analyst and one admin is provided for the
-    demo script.
+    tests can inject a known catalogue. AUTH-001: the
+    default catalogue is intentionally **empty** so
+    misconfigured deployments fail closed (no default
+    credentials are ever hard-coded). Tests / demos inject
+    their own catalogue plus a credentials map.
     """
 
-    DEFAULT_IDENTITIES: Dict[str, Identity] = {
-        "user-analyst-001": Identity(
-            subject_id="user-analyst-001",
-            role=ANALYST_ROLE,
-            display_name="Default Analyst",
-        ),
-        "user-admin-001": Identity(
-            subject_id="user-admin-001",
-            role=ADMIN_ROLE,
-            display_name="Default Admin",
-        ),
-    }
+    DEFAULT_IDENTITIES: Dict[str, Identity] = {}
 
     def __init__(
         self,
         identities: Optional[Dict[str, Identity]] = None,
+        credentials: Optional[Dict[str, str]] = None,
     ) -> None:
         seed = identities if identities is not None else self.DEFAULT_IDENTITIES
         if not isinstance(seed, dict):
@@ -144,11 +157,38 @@ class InMemoryIdentityStore(IdentityStore):
         self._identities: Dict[str, Identity] = {
             str(k): v for k, v in seed.items()
         }
+        cred_seed = credentials if credentials is not None else {}
+        if not isinstance(cred_seed, dict):
+            raise ValueError(
+                "credentials must be a dict[subject_id -> str]"
+            )
+        self._credentials: Dict[str, str] = {
+            str(k): str(v) for k, v in cred_seed.items()
+        }
 
     def get(self, subject_id: str) -> Optional[Identity]:
         if not isinstance(subject_id, str) or not subject_id:
             return None
         return self._identities.get(subject_id)
+
+    def verify_credential(
+        self, subject_id: str, credential: str,
+    ) -> bool:
+        """AUTH-001: verify a presented credential.
+
+        Uses :func:`hmac.compare_digest` for timing-safe
+        comparison. Returns ``False`` when either input is
+        missing / wrong type or when the subject has no
+        registered credential.
+        """
+        if not isinstance(subject_id, str) or not subject_id:
+            return False
+        if not isinstance(credential, str) or not credential:
+            return False
+        expected = self._credentials.get(subject_id)
+        if expected is None:
+            return False
+        return _hmac.compare_digest(expected, credential)
 
     def all_subject_ids(self) -> Tuple[str, ...]:
         return tuple(self._identities.keys())

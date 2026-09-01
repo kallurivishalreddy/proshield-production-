@@ -75,10 +75,21 @@ class Permission:
     # Evidence visibility
     EVENT_READ = "event:read"
     DETECTION_READ = "detection:read"
+    CORRELATION_READ = "correlation:read"
+    TIMELINE_READ = "timeline:read"
+    OVERVIEW_READ = "overview:read"
 
     # Rule management (admin only)
     RULE_READ = "rule:read"
     RULE_WRITE = "rule:write"
+
+    # Source management (admin only). Distinct from
+    # RULE_WRITE so a future slice can grant one without
+    # the other. Previously the source-management layer
+    # reused RULE_WRITE (an odd coupling) — see the
+    # SourceManagementService._require_role() note.
+    SOURCE_READ = "source:read"
+    SOURCE_WRITE = "source:write"
 
 
 ALL_PERMISSIONS: FrozenSet[str] = frozenset(
@@ -99,7 +110,11 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         Permission.ROUTING_READ,
         Permission.EVENT_READ,
         Permission.DETECTION_READ,
+        Permission.CORRELATION_READ,
+        Permission.TIMELINE_READ,
+        Permission.OVERVIEW_READ,
         Permission.RULE_READ,
+        Permission.SOURCE_READ,
     }),
     ADMIN_ROLE: frozenset({
         Permission.CASE_READ,
@@ -115,8 +130,13 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         Permission.ROUTING_OVERRIDE,
         Permission.EVENT_READ,
         Permission.DETECTION_READ,
+        Permission.CORRELATION_READ,
+        Permission.TIMELINE_READ,
+        Permission.OVERVIEW_READ,
         Permission.RULE_READ,
         Permission.RULE_WRITE,
+        Permission.SOURCE_READ,
+        Permission.SOURCE_WRITE,
     }),
     # Collectors submit events but cannot read cases /
     # reports / routing.
@@ -131,7 +151,11 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         Permission.ROUTING_READ,
         Permission.EVENT_READ,
         Permission.DETECTION_READ,
+        Permission.CORRELATION_READ,
+        Permission.TIMELINE_READ,
+        Permission.OVERVIEW_READ,
         Permission.RULE_READ,
+        Permission.SOURCE_READ,
     }),
 }
 

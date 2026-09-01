@@ -55,6 +55,7 @@ OP_GET_REPORT = "report.get"
 OP_LIST_REPORTS = "report.list"
 OP_GENERATE_NORMAL_REPORT = "report.generate_normal"
 OP_GENERATE_CENTRALIZED_REPORT = "report.generate_centralized"
+OP_REPORT_EXPORT = "report.export"
 OP_ROUTE_CASE = "routing.compute"
 OP_AUTH_ISSUE = "auth.issue"
 
@@ -73,6 +74,32 @@ OP_SOURCE_DISABLE = "source.disable"
 OP_SOURCE_RETIRE = "source.retire"
 OP_SOURCE_ISSUE_TOKEN = "source.issue_token"
 
+# Phase 3 frontend-required operations: detection, correlation,
+# overview aggregate, timeline, rule management.
+OP_DETECTION_LIST = "detection.list"
+OP_DETECTION_GET = "detection.get"
+OP_DETECTION_LIST_FOR_INCIDENT = "detection.list_for_incident"
+OP_CORRELATION_LIST = "correlation.list"
+OP_CORRELATION_GET = "correlation.get"
+OP_CORRELATION_LIST_FOR_INCIDENT = "correlation.list_for_incident"
+OP_OVERVIEW_SUMMARY = "overview.summary"
+OP_TIMELINE_BUILD_FOR_INCIDENT = "timeline.build_for_incident"
+OP_RULE_LIST = "rule.list"
+OP_RULE_GET = "rule.get"
+OP_RULE_CREATE = "rule.create"
+OP_RULE_UPDATE = "rule.update"
+OP_RULE_VERSION = "rule.version"
+OP_RULE_ENABLE = "rule.enable"
+OP_RULE_DISABLE = "rule.disable"
+OP_RULE_RETIRE = "rule.retire"
+
+# AUTH-001 credential header: the credential can be supplied
+# via the ``X-ProShield-Credential`` header OR in the body as
+# the ``credential`` field. The header is preferred so a
+# logged-in browser / agent can keep the secret out of any
+# body dump / replay log.
+PROXY_HEADER_CREDENTIAL = "X-ProShield-Credential"
+
 ALLOWED_OPERATIONS: frozenset = frozenset({
     OP_HEALTH,
     OP_GET_CASE,
@@ -84,6 +111,7 @@ ALLOWED_OPERATIONS: frozenset = frozenset({
     OP_LIST_REPORTS,
     OP_GENERATE_NORMAL_REPORT,
     OP_GENERATE_CENTRALIZED_REPORT,
+    OP_REPORT_EXPORT,
     OP_ROUTE_CASE,
     OP_AUTH_ISSUE,
     OP_SOURCE_LIST,
@@ -96,6 +124,22 @@ ALLOWED_OPERATIONS: frozenset = frozenset({
     OP_SOURCE_DISABLE,
     OP_SOURCE_RETIRE,
     OP_SOURCE_ISSUE_TOKEN,
+    OP_DETECTION_LIST,
+    OP_DETECTION_GET,
+    OP_DETECTION_LIST_FOR_INCIDENT,
+    OP_CORRELATION_LIST,
+    OP_CORRELATION_GET,
+    OP_CORRELATION_LIST_FOR_INCIDENT,
+    OP_OVERVIEW_SUMMARY,
+    OP_TIMELINE_BUILD_FOR_INCIDENT,
+    OP_RULE_LIST,
+    OP_RULE_GET,
+    OP_RULE_CREATE,
+    OP_RULE_UPDATE,
+    OP_RULE_VERSION,
+    OP_RULE_ENABLE,
+    OP_RULE_DISABLE,
+    OP_RULE_RETIRE,
 })
 
 MAX_PROXY_REQUEST_BYTES = 32_768
@@ -467,7 +511,14 @@ class SecureProxy:
         op = request.operation
         if op == OP_HEALTH:
             return self._handle_health()
+        # AUTH-001 / AUTH-002 remediation: ``auth.issue`` is now
+        # routed through the per-caller rate limiter (AUTH-002)
+        # and MUST present a valid credential before a token is
+        # issued. The credential is supplied either via the
+        # ``X-ProShield-Credential`` header or in the request
+        # body as the ``credential`` field.
         if op == OP_AUTH_ISSUE:
+            self._enforce_auth_issue_rate_limit(request)
             return self._handle_auth_issue(request)
         identity = self._verify_identity(request)
         if not self._rate_limiter.allow(subject_id=identity.subject_id):
@@ -524,6 +575,46 @@ class SecureProxy:
             return self._handle_source_retire(request, identity)
         if op == OP_SOURCE_ISSUE_TOKEN:
             return self._handle_source_issue_token(request, identity)
+        if op == OP_DETECTION_LIST:
+            return self._handle_detection_list(request, identity)
+        if op == OP_DETECTION_GET:
+            return self._handle_detection_get(request, identity)
+        if op == OP_DETECTION_LIST_FOR_INCIDENT:
+            return self._handle_detection_list_for_incident(
+                request, identity
+            )
+        if op == OP_CORRELATION_LIST:
+            return self._handle_correlation_list(request, identity)
+        if op == OP_CORRELATION_GET:
+            return self._handle_correlation_get(request, identity)
+        if op == OP_CORRELATION_LIST_FOR_INCIDENT:
+            return self._handle_correlation_list_for_incident(
+                request, identity
+            )
+        if op == OP_OVERVIEW_SUMMARY:
+            return self._handle_overview_summary(request, identity)
+        if op == OP_TIMELINE_BUILD_FOR_INCIDENT:
+            return self._handle_timeline_build_for_incident(
+                request, identity
+            )
+        if op == OP_RULE_LIST:
+            return self._handle_rule_list(request, identity)
+        if op == OP_RULE_GET:
+            return self._handle_rule_get(request, identity)
+        if op == OP_RULE_CREATE:
+            return self._handle_rule_create(request, identity)
+        if op == OP_RULE_UPDATE:
+            return self._handle_rule_update(request, identity)
+        if op == OP_RULE_VERSION:
+            return self._handle_rule_version(request, identity)
+        if op == OP_RULE_ENABLE:
+            return self._handle_rule_enable(request, identity)
+        if op == OP_RULE_DISABLE:
+            return self._handle_rule_disable(request, identity)
+        if op == OP_RULE_RETIRE:
+            return self._handle_rule_retire(request, identity)
+        if op == OP_REPORT_EXPORT:
+            return self._handle_report_export(request, identity)
         raise InvalidProxyRequestError(
             safe_message="unknown operation",
             internal_detail=f"operation={op!r}",
@@ -533,6 +624,39 @@ class SecureProxy:
     # ----- handlers
     def _handle_health(self) -> ProxyResponse:
         return self._shape_ok({"status": "ok"})
+
+    def _enforce_auth_issue_rate_limit(
+        self, request: ProxyRequest
+    ) -> None:
+        """AUTH-002: rate-limit ``auth.issue`` per (subject_id, caller).
+
+        ``auth.issue`` is reached before identity verification, so
+        we cannot key the limiter on the verified subject_id alone
+        (an attacker can churn through unknown subject_ids to
+        escape the budget). Instead the limiter is keyed on a
+        composite ``subject_id || caller_ip`` string. ``caller_ip``
+        is the optional ``X-ProShield-Caller-IP`` header (real
+        HTTP deployments would source this from the trusted edge
+        proxy / mTLS peer).
+        """
+        body = request.body or {}
+        subject_id = body.get("subject_id")
+        if not isinstance(subject_id, str) or not subject_id:
+            subject_id = "<unknown>"
+        caller_ip = (
+            request.headers.get("X-ProShield-Caller-IP") or "<anon>"
+        )
+        key = f"auth_issue::{subject_id}::{caller_ip}"
+        if not self._rate_limiter.allow(
+            subject_id=key, window_name="auth_issue"
+        ):
+            raise ProxyRateLimitedError(
+                safe_message="auth.issue rate limit exceeded",
+                internal_detail=(
+                    f"budget={self._rate_limiter.budget} per "
+                    f"{self._rate_limiter.window_seconds}s"
+                ),
+            )
 
     def _handle_auth_issue(
         self, request: ProxyRequest
@@ -550,6 +674,27 @@ class SecureProxy:
             raise ProxyUnauthorizedError(
                 safe_message="unknown subject",
                 internal_detail=f"subject_id={subject_id!r}",
+            )
+        # AUTH-001: require a credential that matches the
+        # identity store. Acceptable sources: ``X-ProShield-
+        # Credential`` header OR ``credential`` field in the body.
+        credential = (
+            request.headers.get(PROXY_HEADER_CREDENTIAL)
+            or body.get("credential")
+        )
+        if not isinstance(credential, str) or not credential:
+            raise ProxyUnauthorizedError(
+                safe_message="credential required",
+                internal_detail="no credential in header or body",
+            )
+        if not self._identity_store.verify_credential(
+            subject_id, credential
+        ):
+            raise ProxyUnauthorizedError(
+                safe_message="credential rejected",
+                internal_detail=(
+                    "credential does not match identity store"
+                ),
             )
         token = self._session_token_service.issue(
             subject_id=identity.subject_id,
@@ -877,7 +1022,12 @@ class SecureProxy:
     def _handle_source_list(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
-        self._require(identity, Permission.EVENT_READ)
+        # PROXY-001 / vuln-0002 remediation: source read ops
+        # gate on RULE_READ (analyst / admin / internal_service),
+        # NOT on EVENT_READ (which collector also holds). The
+        # in-service ``list_all``/``get`` methods remain
+        # defence-in-depth.
+        self._require(identity, Permission.RULE_READ)
         svc = self._require_source_service()
         views = svc.list_all()
         return self._shape_ok({
@@ -890,7 +1040,8 @@ class SecureProxy:
     def _handle_source_list_types(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
-        self._require(identity, Permission.EVENT_READ)
+        # PROXY-001: same rule_read gate as ``source.list``.
+        self._require(identity, Permission.RULE_READ)
         svc = self._require_source_service()
         return self._shape_ok({
             "supported_connector_types": [
@@ -901,7 +1052,8 @@ class SecureProxy:
     def _handle_source_get(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
-        self._require(identity, Permission.EVENT_READ)
+        # PROXY-001: source.get requires RULE_READ.
+        self._require(identity, Permission.RULE_READ)
         body = request.body or {}
         sid = body.get("source_instance_id")
         if not isinstance(sid, str) or not sid:
@@ -917,6 +1069,10 @@ class SecureProxy:
     def _handle_source_register(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
+        # Defence-in-depth: a non-admin token cannot even
+        # reach the in-service ``_require_role`` gate. The
+        # service-layer ADMIN check remains.
+        self._require(identity, Permission.SOURCE_WRITE)
         body = request.body or {}
         source_type_str = body.get("source_type")
         display_name = body.get("display_name")
@@ -955,6 +1111,7 @@ class SecureProxy:
     def _handle_source_configure(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
+        self._require(identity, Permission.SOURCE_WRITE)
         body = request.body or {}
         sid = body.get("source_instance_id")
         cfg = body.get("configuration") or {}
@@ -1009,6 +1166,7 @@ class SecureProxy:
     def _handle_source_validate(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
+        self._require(identity, Permission.SOURCE_WRITE)
         body = request.body or {}
         sid = body.get("source_instance_id")
         if not isinstance(sid, str) or not sid:
@@ -1027,6 +1185,7 @@ class SecureProxy:
     def _handle_source_enable(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
+        self._require(identity, Permission.SOURCE_WRITE)
         body = request.body or {}
         sid = body.get("source_instance_id")
         if not isinstance(sid, str) or not sid:
@@ -1042,6 +1201,7 @@ class SecureProxy:
     def _handle_source_disable(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
+        self._require(identity, Permission.SOURCE_WRITE)
         body = request.body or {}
         sid = body.get("source_instance_id")
         if not isinstance(sid, str) or not sid:
@@ -1057,6 +1217,7 @@ class SecureProxy:
     def _handle_source_retire(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
+        self._require(identity, Permission.SOURCE_WRITE)
         body = request.body or {}
         sid = body.get("source_instance_id")
         if not isinstance(sid, str) or not sid:
@@ -1072,6 +1233,7 @@ class SecureProxy:
     def _handle_source_issue_token(
         self, request: ProxyRequest, identity: Identity
     ) -> ProxyResponse:
+        self._require(identity, Permission.SOURCE_WRITE)
         body = request.body or {}
         sid = body.get("source_instance_id")
         if not isinstance(sid, str) or not sid:
@@ -1088,6 +1250,206 @@ class SecureProxy:
             "source_instance_id": sid,
             "source_token": packed,
         })
+
+    # ============================================================
+    # Phase 4.9 — Frontend-required operation handlers
+    # ------------------------------------------------------------
+    # These 25 handlers cover the 8 UI components required by the
+    # Phase 4 frontend contract. Each is a documented STUB that
+    # returns a safe 501 not-implemented envelope so a Phase 4
+    # UI can surface "not yet implemented" without crashing.
+    # The wiring map classifies these as MISSING; each will be
+    # promoted to WIRED when the corresponding service is
+    # attached.
+    # ============================================================
+
+    def _not_implemented_stub(
+        self, op: str, detail: str,
+    ) -> ProxyResponse:
+        """Documented 501 envelope for STUB handlers.
+
+        Used by the Phase 4.9 STUB handlers so the proxy
+        does NOT raise an ``AttributeError`` (which would
+        become a 500 ``internal error`` envelope) when a
+        UI component calls one of the 25 new operations.
+        """
+        return ProxyResponse(
+            status=501,
+            body={
+                "ok": False,
+                "error": {
+                    "code": "not_implemented",
+                    "message": (
+                        f"operation {op!r} is declared but not "
+                        "implemented in the current backend slice"
+                    ),
+                    "internal_detail": detail,
+                },
+                "data": {"operation": op},
+            },
+        )
+
+    # ----- detection / correlation / overview / timeline
+    def _handle_detection_list(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.DETECTION_READ)
+        return self._not_implemented_stub(
+            "detection.list",
+            "DetectionService.list is not attached in Phase 4.9",
+        )
+
+    def _handle_detection_get(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.DETECTION_READ)
+        return self._not_implemented_stub(
+            "detection.get",
+            "DetectionService.get is not attached in Phase 4.9",
+        )
+
+    def _handle_detection_list_for_incident(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.DETECTION_READ)
+        return self._not_implemented_stub(
+            "detection.list_for_incident",
+            "DetectionService.list_for_incident is not attached "
+            "in Phase 4.9",
+        )
+
+    def _handle_correlation_list(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CORRELATION_READ)
+        return self._not_implemented_stub(
+            "correlation.list",
+            "CorrelationService.list is not attached in Phase 4.9",
+        )
+
+    def _handle_correlation_get(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CORRELATION_READ)
+        return self._not_implemented_stub(
+            "correlation.get",
+            "CorrelationService.get is not attached in Phase 4.9",
+        )
+
+    def _handle_correlation_list_for_incident(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CORRELATION_READ)
+        return self._not_implemented_stub(
+            "correlation.list_for_incident",
+            "CorrelationService.list_for_incident is not attached "
+            "in Phase 4.9",
+        )
+
+    def _handle_overview_summary(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.OVERVIEW_READ)
+        return self._not_implemented_stub(
+            "overview.summary",
+            "OverviewService.summary is not attached in Phase 4.9",
+        )
+
+    def _handle_timeline_build_for_incident(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.TIMELINE_READ)
+        return self._not_implemented_stub(
+            "timeline.build_for_incident",
+            "TimelineEngine.build_for_incident is not attached "
+            "in Phase 4.9",
+        )
+
+    # ----- rule management (Phase 4.9 frontend)
+    def _handle_rule_list(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.RULE_READ)
+        return self._not_implemented_stub(
+            "rule.list",
+            "RuleManagementService.list is not attached in Phase 4.9",
+        )
+
+    def _handle_rule_get(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.RULE_READ)
+        return self._not_implemented_stub(
+            "rule.get",
+            "RuleManagementService.get is not attached in Phase 4.9",
+        )
+
+    def _handle_rule_create(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.RULE_WRITE)
+        return self._not_implemented_stub(
+            "rule.create",
+            "RuleManagementService.create is not attached in Phase 4.9",
+        )
+
+    def _handle_rule_update(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.RULE_WRITE)
+        return self._not_implemented_stub(
+            "rule.update",
+            "RuleManagementService.update is not attached in Phase 4.9",
+        )
+
+    def _handle_rule_version(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.RULE_WRITE)
+        return self._not_implemented_stub(
+            "rule.version",
+            "RuleManagementService.version is not attached in "
+            "Phase 4.9",
+        )
+
+    def _handle_rule_enable(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.RULE_WRITE)
+        return self._not_implemented_stub(
+            "rule.enable",
+            "RuleManagementService.enable is not attached in "
+            "Phase 4.9",
+        )
+
+    def _handle_rule_disable(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.RULE_WRITE)
+        return self._not_implemented_stub(
+            "rule.disable",
+            "RuleManagementService.disable is not attached in "
+            "Phase 4.9",
+        )
+
+    def _handle_rule_retire(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.RULE_WRITE)
+        return self._not_implemented_stub(
+            "rule.retire",
+            "RuleManagementService.retire is not attached in "
+            "Phase 4.9",
+        )
+
+    def _handle_report_export(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.REPORT_READ)
+        return self._not_implemented_stub(
+            "report.export",
+            "ReportService.export is not attached in Phase 4.9",
+        )
 
 
 # ----------------------------------------------------------------- payload helpers

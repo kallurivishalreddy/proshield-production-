@@ -1,7 +1,9 @@
 """Phase 4.9 — Inbound ingress proxy tests."""
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
+from typing import Dict
 
 import pytest
 
@@ -41,6 +43,34 @@ _NOW = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
 _SECRET = new_development_signing_key()
 
 
+class _InMemoryReplayStore:
+    """R-1 test double: server-side single-use token store."""
+
+    def __init__(self) -> None:
+        self._used: Dict[str, datetime] = {}
+        self._lock = threading.Lock()
+
+    def claim(self, *, token_id, expires_at):
+        with self._lock:
+            if token_id in self._used:
+                return False
+            self._used[token_id] = expires_at
+            return True
+
+    def release(self, token_id):
+        with self._lock:
+            self._used.pop(token_id, None)
+
+    def gc(self, now):
+        with self._lock:
+            expired = [
+                tid for tid, exp in self._used.items() if exp <= now
+            ]
+            for tid in expired:
+                del self._used[tid]
+            return len(expired)
+
+
 def _config() -> ProShieldConfig:
     return ProShieldConfig(
         env_name="test",
@@ -55,6 +85,9 @@ def _config() -> ProShieldConfig:
         ingress_rate_limit_per_minute=600,
         ingress_max_request_bytes=32_768,
         ingress_max_response_bytes=1_048_576,
+        ingress_event_rate_limit_per_minute=600,
+        ingress_max_events_per_request=100,
+        ingress_replay_store_required=True,
     )
 
 
@@ -108,7 +141,11 @@ def _proxy(
         config=config,
         registry=registry or SourceRegistry(),
         token_verifier=SourceIdentityTokenVerifier.from_secret(
-            _SECRET, max_lifetime_seconds=3600,
+            _SECRET,
+            max_lifetime_seconds=3600,
+            # ST-02 fail-closed: tests wire a replay store so
+            # tokens can be replay-claimed during the test.
+            replay_store=_InMemoryReplayStore(),
         ),
         ingestion_service=(
             ingestion_service or _ingestion_service()
@@ -423,13 +460,32 @@ class TestIngressIngestion:
 
 
 class TestIngressRateLimit:
+    def _ok_event(self, i: int) -> dict:
+        """Helper: build a well-formed event with a unique
+        event_id, for the ST-01 batch tests.
+        """
+        return {
+            "event_type": "authentication_failure",
+            "event_id": (
+                f"0198c2a1-7e3b-7a8e-b7b6-4f6a7d4d5f{i:02x}"
+            ),
+            "event_time": "2026-08-30T12:00:00Z",
+            "endpoint": "https://example.com/api/ingest",
+            "asset": "web-app",
+            "details": {"status_code": 401},
+        }
+
     def test_rate_limit_blocks_after_budget(self) -> None:
         reg = SourceRegistry()
         inst = _enabled_nginx_instance()
         reg.register(inst)
         proxy = _proxy(registry=reg, rate_limit=2)
-        token = _issue(_issuer(), inst)
+        issuer = _issuer()
+        # Each iteration issues a FRESH token (R-1 single-use
+        # is enforced by the verifier's replay store; the
+        # rate-limit budget is the per-source window).
         for _ in range(2):
+            token = _issue(issuer, inst)
             r = proxy.handle(IngressRequest(
                 operation=OP_INGEST,
                 headers={
@@ -438,12 +494,111 @@ class TestIngressRateLimit:
                 body={"events": []},
             ))
             assert r.status == 200
+        # 3rd request — must be rate-limited (budget=2).
+        # Fresh token so R-1 doesn't reject before we
+        # reach the rate-limit check.
+        token3 = _issue(issuer, inst)
         r = proxy.handle(IngressRequest(
             operation=OP_INGEST,
             headers={
-                INGRESS_HEADER_AUTHORIZATION: f"Bearer {token}",
+                INGRESS_HEADER_AUTHORIZATION: f"Bearer {token3}",
             },
             body={"events": []},
         ))
         assert r.status == 429
         assert "rate_limited" in r.body["error"]["code"]
+
+    def test_st01_per_event_rate_limit_charges_full_batch(self) -> None:
+        """ST-01: a request carrying N events must charge N
+        units of the rate-limit budget, not 1.
+
+        The per-source sliding window is charged
+        ``1 + len(events)``: the leading ``1`` is the
+        per-request cost (preserves the pre-Phase-4.9 burst
+        behaviour); the ``len(events)`` term is the new
+        per-event charge so a single request carrying N
+        events cannot amplify the per-event limit.
+        """
+        reg = SourceRegistry()
+        inst = _enabled_nginx_instance()
+        reg.register(inst)
+        # budget=5: a 3-event request costs 1+3=4 units;
+        # a follow-up 1-event request costs 1+1=2 units,
+        # which would push the total to 6 > 5, so the
+        # second request MUST be rate-limited.
+        proxy = _proxy(registry=reg, rate_limit=5)
+        issuer = _issuer()
+        token = _issue(issuer, inst)
+        r1 = proxy.handle(IngressRequest(
+            operation=OP_INGEST,
+            headers={INGRESS_HEADER_AUTHORIZATION: f"Bearer {token}"},
+            body={"events": [self._ok_event(i) for i in range(3)]},
+        ))
+        assert r1.status == 200
+        assert len(r1.body["data"]["accepted_event_ids"]) == 3
+        # Request 2: a single-event request now exceeds the
+        # remaining 1-unit budget (1 request + 1 event = 2).
+        token2 = _issue(issuer, inst)
+        r2 = proxy.handle(IngressRequest(
+            operation=OP_INGEST,
+            headers={INGRESS_HEADER_AUTHORIZATION: f"Bearer {token2}"},
+            body={"events": [self._ok_event(99)]},
+        ))
+        assert r2.status == 429
+        assert "rate_limited" in r2.body["error"]["code"]
+
+    def test_st01_per_request_event_cap_rejected(self) -> None:
+        """ST-01: a request whose ``events`` array exceeds
+        ``ingress_max_events_per_request`` is rejected with
+        400 BEFORE the rate-limit budget is touched.
+        """
+        reg = SourceRegistry()
+        inst = _enabled_nginx_instance()
+        reg.register(inst)
+        proxy = _proxy(registry=reg, rate_limit=1000)
+        issuer = _issuer()
+        # Build a payload with 200 events. Default cap is 100.
+        big_batch = [self._ok_event(i) for i in range(200)]
+        token = _issue(issuer, inst)
+        r = proxy.handle(IngressRequest(
+            operation=OP_INGEST,
+            headers={INGRESS_HEADER_AUTHORIZATION: f"Bearer {token}"},
+            body={"events": big_batch},
+        ))
+        assert r.status == 400
+        assert r.body["error"]["code"] == "validation_error"
+        assert "too many events" in r.body["error"]["message"]
+
+    def test_st04_untrusted_endpoint_reconciled(self) -> None:
+        """ST-04: source-reported ``endpoint`` that does NOT
+        match the registered source configuration is recorded
+        under ``details._untrusted_endpoint`` and is NOT
+        promoted to the canonical ``endpoint`` field.
+        """
+        reg = SourceRegistry()
+        inst = _enabled_nginx_instance()
+        # Registered endpoint is "https://example.com/api/ingest".
+        reg.register(inst)
+        proxy = _proxy(registry=reg)
+        issuer = _issuer()
+        token = _issue(issuer, inst)
+        r = proxy.handle(IngressRequest(
+            operation=OP_INGEST,
+            headers={INGRESS_HEADER_AUTHORIZATION: f"Bearer {token}"},
+            body={"events": [{
+                "event_type": "authentication_failure",
+                "event_id": "0198c2a1-7e3b-7a8e-b7b6-4f6a7d4d5fa1",
+                "event_time": "2026-08-30T12:00:00Z",
+                "endpoint": "https://evil.example.com/leak",
+                "asset": "web-app",
+            }]},
+        ))
+        assert r.status == 200
+        accepted_id = r.body["data"]["accepted_event_ids"][0]
+        # The untrusted endpoint was recorded in details.
+        repo = proxy._ingestion_service._repository  # type: ignore[attr-defined]
+        ev = repo.get_by_event_id(accepted_id)
+        assert ev is not None
+        assert ev.details.get("_untrusted_endpoint") == (
+            "https://evil.example.com/leak"
+        )

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List
 
 
 def _env(name: str, default: str) -> str:
@@ -32,6 +32,31 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(
             f"environment variable {name} must be an integer, got {raw!r}"
         ) from exc
+
+
+def _parse_credentials(raw: str) -> Dict[str, str]:
+    """Parse a ``subject:credential,subject:credential`` env value.
+
+    AUTH-001 remediation: the default identity catalogue now
+    requires a credential. Empty values yield an empty mapping;
+    tests / deployments inject explicit credentials via
+    ``PROSHIELD_DEFAULT_SUBJECT_CREDENTIALS``.
+    """
+    out: Dict[str, str] = {}
+    if not raw:
+        return out
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            continue
+        sub, _, cred = pair.partition(":")
+        sub = sub.strip()
+        cred = cred.strip()
+        if sub and cred:
+            out[sub] = cred
+    return out
 
 
 @dataclass(frozen=True)
@@ -82,14 +107,79 @@ class ProShieldConfig:
     # at the trusted inbound boundary so a single oversized
     # payload cannot exhaust memory. ``ingress_max_response_bytes``
     # caps the response size the boundary will emit.
+    #
+    # ``ingress_event_rate_limit_per_minute`` is the
+    # **per-event** budget — the per-request budget (above)
+    # is multiplied by the request event count. Together
+    # they cap multi-event batch amplification (ST-01
+    # remediation).
+    # ``ingress_max_events_per_request`` bounds the number
+    # of events a single ingress request may carry.
+    # ``ingress_replay_store_required`` is the
+    # fail-closed gate for R-1 replay protection (ST-02
+    # remediation); production deployments must keep the
+    # default ``True``.
+    # ``secret_store_configured`` is the gate for ST-03
+    # (``secret_ref`` persistence integrity). When ``False``,
+    # a non-empty ``secret_ref`` is rejected at the wire.
+    # ``default_subject_credentials`` is the seed
+    # ``{subject_id: shared_secret}`` map used by the
+    # Phase 4.8 credential-verifying ``auth.issue`` flow
+    # (AUTH-001 / AUTH-002 remediation). The default empty
+    # mapping forces every test / deployment to inject
+    # explicit credentials via env var.
     source_signing_key: str = ""
     source_token_lifetime_seconds: int = 3600
     ingress_rate_limit_per_minute: int = 600
     ingress_max_request_bytes: int = 32_768
+    ingress_event_rate_limit_per_minute: int = 600
+    ingress_max_events_per_request: int = 100
+    ingress_replay_store_required: bool = True
+    secret_store_configured: bool = False
+    default_subject_credentials: Dict[str, str] = field(
+        default_factory=dict
+    )
     ingress_max_response_bytes: int = 1_048_576  # 1 MiB
 
     # Comma-separated "name:module.path:ClassName" entries.
     connector_specs: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Fail-fast startup validation for security-sensitive fields.
+
+        ST-03 / AUTH-001 hardening: in any **production-like**
+        environment (production / staging / preview), both
+        signing keys MUST be non-empty. The ``development`` /
+        ``test`` env-names preserve the empty-key fallback so
+        tests and demo scripts can construct an isolated config
+        and inject keys explicitly. Production deployments must
+        set ``PROSHIELD_ENV=production`` (or one of the other
+        production-like names) so the check fires at startup.
+        The runtime wiring (InboundIngressProxy) enforces the
+        ST-02 replay-store requirement independently.
+        """
+        prod_like = {"production", "staging", "preview", "prod"}
+        if self.env_name in prod_like:
+            if (
+                not isinstance(self.auth_signing_key, str)
+                or not self.auth_signing_key
+            ):
+                raise ValueError(
+                    "ProShieldConfig.auth_signing_key must be a "
+                    "non-empty str in production environments "
+                    "(env_name=" + str(self.env_name) + "); see "
+                    "PROSHIELD_AUTH_SIGNING_KEY"
+                )
+            if (
+                not isinstance(self.source_signing_key, str)
+                or not self.source_signing_key
+            ):
+                raise ValueError(
+                    "ProShieldConfig.source_signing_key must be a "
+                    "non-empty str in production environments "
+                    "(env_name=" + str(self.env_name) + "); see "
+                    "PROSHIELD_SOURCE_SIGNING_KEY"
+                )
 
     @classmethod
     def from_env(cls) -> "ProShieldConfig":
@@ -143,6 +233,21 @@ class ProShieldConfig:
             ingress_max_response_bytes=_env_int(
                 "PROSHIELD_INGRESS_MAX_RESPONSE_BYTES", 1_048_576
             ),
+            ingress_event_rate_limit_per_minute=_env_int(
+                "PROSHIELD_INGRESS_EVENT_RATE_LIMIT_PER_MINUTE", 600
+            ),
+            ingress_max_events_per_request=_env_int(
+                "PROSHIELD_INGRESS_MAX_EVENTS_PER_REQUEST", 100
+            ),
+            ingress_replay_store_required=_env(
+                "PROSHIELD_INGRESS_REPLAY_STORE_REQUIRED", "1"
+            ) not in ("0", "false", "False", ""),
+            secret_store_configured=_env(
+                "PROSHIELD_SECRET_STORE_CONFIGURED", "0"
+            ) in ("1", "true", "True"),
+            default_subject_credentials=_parse_credentials(
+                _env("PROSHIELD_DEFAULT_SUBJECT_CREDENTIALS", "")
+            ),
             connector_specs=connector_specs,
         )
 
@@ -175,5 +280,14 @@ class ProShieldConfig:
             "ingress_rate_limit_per_minute": self.ingress_rate_limit_per_minute,
             "ingress_max_request_bytes": self.ingress_max_request_bytes,
             "ingress_max_response_bytes": self.ingress_max_response_bytes,
+            "ingress_event_rate_limit_per_minute":
+                self.ingress_event_rate_limit_per_minute,
+            "ingress_max_events_per_request":
+                self.ingress_max_events_per_request,
+            "ingress_replay_store_required":
+                self.ingress_replay_store_required,
+            "secret_store_configured": self.secret_store_configured,
+            "default_subject_credentials_count":
+                len(self.default_subject_credentials),
             "connectors": self.connector_specs,
         }

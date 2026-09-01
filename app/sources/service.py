@@ -527,7 +527,14 @@ class SourceManagementService:
 
 # ----------------------------------------------------------------- helpers
 def _require_role(identity: Identity, role: str) -> None:
-    """Authorise a write operation against the source-management layer."""
+    """Authorise a write operation against the source-management layer.
+
+    Defence-in-depth: this is the **service-layer** gate
+    invoked after the proxy-level ``SOURCE_WRITE`` permission
+    check. We no longer reuse ``RULE_WRITE`` (an odd coupling
+    the wiring-verification audit flagged); source management
+    now uses its own ``source:write`` permission.
+    """
     if not isinstance(identity, Identity):
         raise SourceAuthorizationError(
             safe_message="source write denied",
@@ -545,11 +552,11 @@ def _require_role(identity: Identity, role: str) -> None:
         if not has_permission(
             role=identity.role,
             identity_permissions=identity.permissions,
-            permission=Permission.RULE_WRITE,
+            permission=Permission.SOURCE_WRITE,
         ):
             raise SourceAuthorizationError(
                 safe_message="source write denied",
-                internal_detail="missing rule:write permission",
+                internal_detail="missing source:write permission",
             )
 
 

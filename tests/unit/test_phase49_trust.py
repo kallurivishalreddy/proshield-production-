@@ -32,17 +32,11 @@ _OTHER_SECRET = new_development_signing_key()
 _ISSUER = SourceIdentityTokenIssuer(
     secret=_SECRET, lifetime_seconds=600
 )
-_VERIFIER = SourceIdentityTokenVerifier.from_secret(
-    _SECRET, max_lifetime_seconds=3600,
-)
-
-_SID = SourceInstanceId(
-    "src-0198c2a1-7e3b-7a8e-b7b6-4f6a7d4d5f12-prod"
-)
 
 
 # -----------------------------------------------------------------------
-# Replay store test double (R-1)
+# Replay store test double (R-1) — defined before the module-level
+# verifier below so the verifier can be constructed with one.
 # -----------------------------------------------------------------------
 class _InMemoryReplayStore:
     """Server-side single-use token store.
@@ -76,6 +70,26 @@ class _InMemoryReplayStore:
             for tid in expired:
                 del self._used[tid]
             return len(expired)
+
+
+_VERIFIER = SourceIdentityTokenVerifier.from_secret(
+    _SECRET,
+    max_lifetime_seconds=3600,
+    # ST-02 fail-closed: tests wire a replay store so the
+    # verifier can replay-claim tokens.
+    replay_store=_InMemoryReplayStore(),
+)
+
+_SID = SourceInstanceId(
+    "src-0198c2a1-7e3b-7a8e-b7b6-4f6a7d4d5f12-prod"
+)
+
+
+# -----------------------------------------------------------------------
+# Replay store test double (R-1)
+# -----------------------------------------------------------------------
+# (Defined above the module-level verifier; this comment
+# block is intentionally retained as a marker.)
 
 
 def _verifier_with_replay(
@@ -145,7 +159,10 @@ class TestTokenIssueAndVerify:
             source_instance_id=_SID, source_type=SourceType.NGINX,
         )
         packed = _ISSUER.pack(token)
-        bad_verifier = SourceIdentityTokenVerifier.from_secret(_OTHER_SECRET)
+        bad_verifier = SourceIdentityTokenVerifier.from_secret(
+            _OTHER_SECRET,
+            replay_store=_InMemoryReplayStore(),
+        )
         with pytest.raises(SourceIdentityTokenError):
             bad_verifier.verify(packed)
 
@@ -321,7 +338,9 @@ class TestMaxLifetimeS2:
         must be rejected by the server-side lifetime cap.
         """
         verifier = SourceIdentityTokenVerifier.from_secret(
-            _SECRET, max_lifetime_seconds=3600,
+            _SECRET,
+            max_lifetime_seconds=3600,
+            replay_store=_InMemoryReplayStore(),
         )
         from app.sources.trust import (
             _canonical_body, _compute_signature, _b64url,
@@ -348,7 +367,9 @@ class TestMaxLifetimeS2:
 
     def test_just_outside_max_rejected(self) -> None:
         verifier = SourceIdentityTokenVerifier.from_secret(
-            _SECRET, max_lifetime_seconds=60,
+            _SECRET,
+            max_lifetime_seconds=60,
+            replay_store=_InMemoryReplayStore(),
         )
         issuer = SourceIdentityTokenIssuer(
             secret=_SECRET,
@@ -429,7 +450,9 @@ class TestKeyringD4:
             keys={"k2": _OTHER_SECRET}, active_key_id="k2",
         )
         verifier = SourceIdentityTokenVerifier(
-            keyring=keyring, max_lifetime_seconds=3600,
+            keyring=keyring,
+            max_lifetime_seconds=3600,
+            replay_store=_InMemoryReplayStore(),
         )
         token = _ISSUER.issue(
             source_instance_id=_SID, source_type=SourceType.NGINX,
@@ -452,7 +475,9 @@ class TestKeyringD4:
             active_key_id="k-new",
         )
         verifier = SourceIdentityTokenVerifier(
-            keyring=keyring, max_lifetime_seconds=3600,
+            keyring=keyring,
+            max_lifetime_seconds=3600,
+            replay_store=_InMemoryReplayStore(),
         )
         token = old_issuer.issue(
             source_instance_id=_SID, source_type=SourceType.NGINX,
@@ -472,7 +497,9 @@ class TestKeyringD4:
             keys={"k-new": new_key}, active_key_id="k-new",
         )
         verifier = SourceIdentityTokenVerifier(
-            keyring=keyring, max_lifetime_seconds=3600,
+            keyring=keyring,
+            max_lifetime_seconds=3600,
+            replay_store=_InMemoryReplayStore(),
         )
         token = old_issuer.issue(
             source_instance_id=_SID, source_type=SourceType.NGINX,
