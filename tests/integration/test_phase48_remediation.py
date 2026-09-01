@@ -60,14 +60,28 @@ def _identity_store():
     from app.auth import (
         ADMIN_ROLE, ANALYST_ROLE, Identity, InMemoryIdentityStore,
     )
-    return InMemoryIdentityStore({
-        "user-analyst-001": Identity(
-            subject_id="user-analyst-001", role=ANALYST_ROLE),
-        "user-analyst-002": Identity(
-            subject_id="user-analyst-002", role=ANALYST_ROLE),
-        "user-admin-001": Identity(
-            subject_id="user-admin-001", role=ADMIN_ROLE),
-    })
+    # AUTH-001 remediation: ``auth.issue`` requires a verified
+    # credential. The integration test identity store is built
+    # with an explicit credentials map (one password per
+    # subject). The helper ``_token`` supplies the matching
+    # password so the call returns a valid token. Hard-coding
+    # these test-only passwords in the integration suite is
+    # consistent with the existing per-test identity catalogue.
+    return InMemoryIdentityStore(
+        identities={
+            "user-analyst-001": Identity(
+                subject_id="user-analyst-001", role=ANALYST_ROLE),
+            "user-analyst-002": Identity(
+                subject_id="user-analyst-002", role=ANALYST_ROLE),
+            "user-admin-001": Identity(
+                subject_id="user-admin-001", role=ADMIN_ROLE),
+        },
+        credentials={
+            "user-analyst-001": "analyst-password-1",
+            "user-analyst-002": "analyst-password-2",
+            "user-admin-001": "admin-password-1",
+        },
+    )
 
 
 def _make_events(n=4, base=None):
@@ -149,9 +163,19 @@ def _token(proxy, subject_id):
     from app.proxy import (
         OP_AUTH_ISSUE, PROXY_HEADER_AUTHORIZATION, ProxyRequest,
     )
+    # AUTH-001 remediation: ``auth.issue`` now requires the
+    # subject's credential. The password must match the
+    # credentials map seeded by ``_identity_store``.
+    password = {
+        "user-analyst-001": "analyst-password-1",
+        "user-analyst-002": "analyst-password-2",
+        "user-admin-001": "admin-password-1",
+    }[subject_id]
     r = proxy.handle(ProxyRequest(
-        operation=OP_AUTH_ISSUE, headers={}, body={"subject_id": subject_id},
+        operation=OP_AUTH_ISSUE, headers={},
+        body={"subject_id": subject_id, "credential": password},
     ))
+    assert r.status == 200, r.body
     return r.body["data"]["token"]
 
 

@@ -46,6 +46,14 @@ from app.proxy import (
     ProxyRequest,
     SecureProxy,
 )
+
+
+# AUTH-001: the credential header name. The constant is
+# defined in ``app.proxy.proxy.PROXY_HEADER_CREDENTIAL`` but
+# is not re-exported from the package ``__init__``; we
+# reproduce the literal here so the test is self-contained
+# (the value MUST match the production code).
+PROXY_HEADER_CREDENTIAL = "X-ProShield-Credential"
 from app.sources import (
     SourceConnectionType,
     SourceIdentityTokenIssuer,
@@ -297,6 +305,16 @@ class TestSourceIdentityTokenRoundTrip:
             issuer.secret,
             max_lifetime_seconds=3600,
             source_resolver=lambda sid: source_repo.get(sid),
+            # ST-02 fail-closed: the production replay_store
+            # gate refuses to construct a verifier without
+            # one. The integration env is MongoDB-backed; the
+            # in-memory _InMemoryReplayStore (defined at the
+            # top of this file) is sufficient because this
+            # test issues a single token and never replays
+            # it. R-1 is exercised by
+            # test_phase49b_remediation.py with the same
+            # backing store.
+            replay_store=_InMemoryReplayStore(),
         ).verify(packed)
         assert verified.source_instance_id == sid
         assert verified.source == "waf"
@@ -437,12 +455,25 @@ class TestSourceProvenancePersistsAcrossPhase448:
             display_name="Prod Nginx",
         )
         sid = view.source_instance_id
+        # ST-04 reconciliation: the wire ``endpoint`` is replaced
+        # with the *registered* ``source.configuration.endpoint``
+        # unless they match *exactly*. When the wire endpoint
+        # does not match, the source ALSO nulls the wire
+        # ``source_ip`` (defence in depth: the wire values
+        # are inconsistent with the registered configuration
+        # and therefore untrusted). The brute-force correlation
+        # pattern requires both ``source_ip`` AND ``endpoint``
+        # on the underlying event, so for the events to remain
+        # correlatable we register the source with the SAME
+        # endpoint that the wire events will report. The
+        # chosen endpoint also contains the auth-shaped hint
+        # (``/login``) so NGINX-AUTH-BRUTEFORCE-001 fires.
         svc.configure(
             identity=_admin(),
             source_instance_id=sid,
             configuration=SourceInstanceConfiguration(
                 connection_type=SourceConnectionType.PUSH,
-                endpoint="https://example.com/api/ingest",
+                endpoint="/api/login",
             ),
         )
         svc.validate_connection(
@@ -524,12 +555,21 @@ class TestSourceProvenancePersistsAcrossPhase448:
         svc.retire(identity=_admin(), source_instance_id=sid)
         events_after = security_event_repo.find_by_source_instance(sid)
         assert len(events_after) == 4
+        # 4 events × 2 rules (FAILURE-001 + BRUTEFORCE-001)
+        # = 8 detection rows persisted.
         all_docs = list(db[detection_repo._collection.name].find({}))
-        assert len(all_docs) >= 4
+        assert len(all_docs) == 8
+        # Single brute-force correlation across 4 distinct
+        # events (8 detection rows recorded in
+        # ``detection_count`` per CORRELATION-01).
+        assert len(cor_result.correlations) == 1
+        corr = cor_result.correlations[0]
+        assert corr.count == 4
+        assert dict(corr.extra).get("detection_count") == 8
         all_corrs = list(
             db[correlation_repo._collection.name].find({})
         )
-        assert len(all_corrs) >= 1
+        assert len(all_corrs) == 1
         assert svc._repository.count() == 1
 
 
@@ -538,14 +578,26 @@ class TestSourceEndToEndThroughProxy:
         self, source_service, test_config,
     ) -> None:
         svc, registry, issuer = source_service
-        identity_store = InMemoryIdentityStore({
-            "user-admin-001": Identity(
-                subject_id="user-admin-001", role=ADMIN_ROLE,
-            ),
-            "user-analyst-001": Identity(
-                subject_id="user-analyst-001", role=ANALYST_ROLE,
-            ),
-        })
+        # AUTH-001: ``InMemoryIdentityStore`` no longer ships
+        # default credentials (fail-closed). The test must
+        # inject both the identity catalogue and the matching
+        # credential map, then pass the credential on every
+        # ``auth.issue`` call (via the ``X-ProShield-Credential``
+        # header or the ``credential`` body field).
+        identity_store = InMemoryIdentityStore(
+            identities={
+                "user-admin-001": Identity(
+                    subject_id="user-admin-001", role=ADMIN_ROLE,
+                ),
+                "user-analyst-001": Identity(
+                    subject_id="user-analyst-001", role=ANALYST_ROLE,
+                ),
+            },
+            credentials={
+                "user-admin-001": "admin-password",
+                "user-analyst-001": "analyst-password",
+            },
+        )
         proxy = SecureProxy(
             config=test_config,
             identity_store=identity_store,
@@ -553,11 +605,13 @@ class TestSourceEndToEndThroughProxy:
         proxy.attach_source_management_service(svc)
 
         admin_token = proxy.handle(ProxyRequest(
-            operation=OP_AUTH_ISSUE, headers={},
+            operation=OP_AUTH_ISSUE,
+            headers={PROXY_HEADER_CREDENTIAL: "admin-password"},
             body={"subject_id": "user-admin-001"},
         )).body["data"]["token"]
         analyst_token = proxy.handle(ProxyRequest(
-            operation=OP_AUTH_ISSUE, headers={},
+            operation=OP_AUTH_ISSUE,
+            headers={PROXY_HEADER_CREDENTIAL: "analyst-password"},
             body={"subject_id": "user-analyst-001"},
         )).body["data"]["token"]
 

@@ -128,7 +128,14 @@ def test_phase46_end_to_end_through_phase45(
     )
     assert corr_result.correlation_count == 1
     corr = corr_result.correlations[0]
-    assert corr.count == 8  # 4 events * 2 detections per event
+    # CORRELATION-01 contract: ``count`` is the number of
+    # DISTINCT events in the cluster (4 here), NOT the
+    # detection-row count (8). The detection row count is
+    # preserved on the correlation record under the
+    # ``detection_count`` extra field.
+    assert corr.count == 4
+    extra = dict(corr.extra)
+    assert extra.get("detection_count") == 8
 
     # 3) Phase 4.6 timeline engine: organize the existing
     #    evidence chronologically. NO new persistence.

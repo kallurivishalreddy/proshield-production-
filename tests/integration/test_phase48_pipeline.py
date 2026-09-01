@@ -91,14 +91,25 @@ def nginx_log(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def identity_store() -> InMemoryIdentityStore:
-    return InMemoryIdentityStore({
-        "user-analyst-001": Identity(
-            subject_id="user-analyst-001", role=ANALYST_ROLE,
-        ),
-        "user-analyst-002": Identity(
-            subject_id="user-analyst-002", role=ANALYST_ROLE,
-        ),
-    })
+    # AUTH-001 remediation: ``auth.issue`` requires a verified
+    # credential. The integration test identity store is built
+    # with an explicit credentials map (one password per
+    # subject). The helper ``_issue_token`` supplies the
+    # matching password so the call returns a valid token.
+    return InMemoryIdentityStore(
+        identities={
+            "user-analyst-001": Identity(
+                subject_id="user-analyst-001", role=ANALYST_ROLE,
+            ),
+            "user-analyst-002": Identity(
+                subject_id="user-analyst-002", role=ANALYST_ROLE,
+            ),
+        },
+        credentials={
+            "user-analyst-001": "analyst-password-1",
+            "user-analyst-002": "analyst-password-2",
+        },
+    )
 
 @pytest.fixture
 def proxy_stack(
@@ -194,11 +205,18 @@ def _run_ingest(
 
 
 def _issue_token(proxy: SecureProxy, subject_id: str) -> str:
+    # AUTH-001 remediation: ``auth.issue`` now requires the
+    # subject's credential. The password must match the
+    # credentials map seeded by the ``identity_store`` fixture.
+    password = {
+        "user-analyst-001": "analyst-password-1",
+        "user-analyst-002": "analyst-password-2",
+    }[subject_id]
     resp = proxy.handle(ProxyRequest(
         operation=OP_AUTH_ISSUE, headers={},
-        body={"subject_id": subject_id},
+        body={"subject_id": subject_id, "credential": password},
     ))
-    assert resp.status == 200
+    assert resp.status == 200, resp.body
     return resp.body["data"]["token"]
 
 

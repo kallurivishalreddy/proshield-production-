@@ -134,11 +134,21 @@ def test_phase45_full_pipeline_correlates_brute_force(
     assert corr_result.correlation_count == 1
     corr = corr_result.correlations[0]
     assert corr.pattern_id == "NGINX-CORR-BRUTEFORCE-001"
-    # The pattern groups by (source_ip, endpoint). The
-    # 4 events produce 8 auth-failure detections (2 per event)
-    # that all share the same key, so the correlation
-    # count is 8.
-    assert corr.count == 8
+    # CORRELATION-01 contract: ``count`` is the number of
+    # DISTINCT events in the cluster (4 here), NOT the
+    # detection-row count (8). The detection row count is
+    # preserved on the correlation record under the
+    # ``detection_count`` extra field so analysts can still
+    # see the original signal magnitude without it inflating
+    # the threshold check.
+    assert corr.count == 4
+    extra = dict(corr.extra)
+    assert extra.get("detection_count") == 8
+    # 4 events × 2 rules = 8 detection_ids; the cluster
+    # carries all of them even though the cluster's
+    # distinct-event count is only 4.
+    assert len(corr.detection_ids) == 8
+    assert len(corr.event_ids) == 4
     assert corr.key.parts == ("198.51.100.7", "/api/login")
 
     corr_repo = CorrelationRepository(db, test_config)
