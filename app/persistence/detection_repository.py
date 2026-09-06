@@ -356,6 +356,159 @@ class DetectionRepository:
             ) from exc
         return [_document_to_detection(d) for d in docs]
 
+    def find_recent(
+        self,
+        cutoff,
+        *,
+        limit: int = 5000,
+    ) -> List[Detection]:
+        """Return detections with ``detected_at >= cutoff``.
+
+        The result is ordered by ``detected_at`` ascending so the
+        live correlation pipeline can run a deterministic
+        window/threshold pass over the recent persisted window.
+
+        Portability note
+        ----------------
+        The in-memory ``FakeCollection`` implementations used by
+        ``scripts/proxy_server.py`` and ``scripts/ingress_server.py``
+        do not support ``$gte`` filter operators or a sort/limit
+        cursor chain the way pymongo does. This method therefore
+        consumes the collection's ``find({})`` result (pymongo
+        cursor, ``FakeCursor``, or plain list — all iterable),
+        filters by timestamp in Python, sorts deterministically, and
+        bounds the result by ``limit`` most-recent rows.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+
+        if not isinstance(cutoff, _dt) or cutoff.tzinfo is None:
+            raise ValidationError(
+                safe_message="cutoff must be a timezone-aware datetime",
+                internal_detail=f"got {type(cutoff).__name__}",
+                field="cutoff",
+            )
+        # V2-07 fix: on a real pymongo collection the window is
+        # evaluated server-side against the documented
+        # ``det_detected_at_desc`` index (``$gte`` + sort + hard
+        # limit) instead of streaming the entire collection into
+        # Python on every detection-bearing event. The Python filter
+        # fallback is kept ONLY for the in-memory dev fakes, whose
+        # ``find`` cannot express operators.
+        from pymongo.collection import Collection as _PymongoCollection
+
+        if isinstance(self._collection, _PymongoCollection):
+            try:
+                cursor = (
+                    self._collection.find(
+                        {"detected_at": {"$gte": cutoff}}
+                    )
+                    .sort("detected_at", 1)
+                    .limit(max(1, int(limit)))
+                )
+                return [_document_to_detection(d) for d in cursor]
+            except PyMongoError as exc:
+                raise PersistenceError(
+                    safe_message="could not read recent detections",
+                    internal_detail=(
+                        f"indexed find failed: {type(exc).__name__}"
+                    ),
+                ) from exc
+        try:
+            raw = self._collection.find({})
+            docs = list(raw)
+        except Exception as exc:  # noqa: BLE001
+            raise PersistenceError(
+                safe_message="could not read recent detections",
+                internal_detail=f"find failed: {type(exc).__name__}",
+            ) from exc
+        kept: List[Dict[str, Any]] = []
+        for doc in docs:
+            detected_at = doc.get("detected_at")
+            if detected_at is None:
+                continue
+            if isinstance(detected_at, str):
+                try:
+                    detected_at = _dt.fromisoformat(
+                        detected_at.replace("Z", "+00:00"),
+                    )
+                except ValueError:
+                    continue
+            if isinstance(detected_at, _dt) and detected_at.tzinfo is None:
+                detected_at = detected_at.replace(tzinfo=_tz.utc)
+            if not isinstance(detected_at, _dt):
+                continue
+            if detected_at >= cutoff:
+                kept.append(doc)
+        kept.sort(key=lambda d: _doc_detected_at_ts(d))
+        if len(kept) > limit:
+            kept = kept[-limit:]
+        return [_document_to_detection(d) for d in kept]
+
+    def find_latest(
+        self,
+        *,
+        limit: int = 200,
+        event_ids: Optional[List[str]] = None,
+    ) -> List[Detection]:
+        """Return the most recent detections, newest first.
+
+        Two bounded read patterns:
+
+        * no ``event_ids`` — the unfiltered recent view served by the
+          unfiltered ``detection.list`` wire op (a truthful recent
+          list, not a fabricated empty one);
+        * with ``event_ids`` — an id-scoped membership lookup used by
+          the unmatched-event visibility surface (V2-06). The result
+          is bounded by ``limit`` and served by the documented
+          ``det_detected_at_desc`` index on real pymongo.
+        """
+        bounded = max(1, min(int(limit), 500))
+        try:
+            if event_ids is not None:
+                # Id-scoped lookup: chunk to keep the $in list bounded.
+                wanted = set(e for e in event_ids if isinstance(e, str) and e)
+                out: List[Detection] = []
+                ids = sorted(wanted)[:500]
+                query: Dict[str, Any] = (
+                    {"event_id": {"$in": ids}} if ids else {}
+                )
+                try:
+                    cursor = (
+                        self._collection.find(query)
+                        .sort("detected_at", -1)
+                        .limit(bounded)
+                    )
+                except TypeError:
+                    # In-memory fakes cannot express $in / sort / limit.
+                    cursor = [
+                        d
+                        for d in self._collection.find({})
+                        if not ids or d.get("event_id") in wanted
+                    ]
+                docs = list(cursor)
+            else:
+                from pymongo.collection import Collection as _PC
+
+                if isinstance(self._collection, _PC):
+                    cursor = (
+                        self._collection.find({})
+                        .sort("detected_at", -1)
+                        .limit(bounded)
+                    )
+                    docs = list(cursor)
+                else:
+                    docs = sorted(
+                        list(self._collection.find({})),
+                        key=_doc_detected_at_ts,
+                        reverse=True,
+                    )[:bounded]
+        except PyMongoError as exc:
+            raise PersistenceError(
+                safe_message="could not list detections",
+                internal_detail=f"find failed: {type(exc).__name__}",
+            ) from exc
+        return [_document_to_detection(d) for d in docs]
+
     def count(self) -> int:
         try:
             return int(self._collection.count_documents({}))
@@ -395,3 +548,22 @@ def _document_to_detection(doc: Dict[str, Any]) -> Detection:
             tzinfo=timezone.utc
         )
     return Detection.model_validate(cleaned)
+
+
+def _doc_detected_at_ts(doc: Dict[str, Any]) -> Any:
+    """Return a sortable key for a detection document's ``detected_at``."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    detected_at = doc.get("detected_at")
+    if isinstance(detected_at, str):
+        try:
+            detected_at = _dt.fromisoformat(
+                detected_at.replace("Z", "+00:00"),
+            )
+        except ValueError:
+            detected_at = None
+    if isinstance(detected_at, _dt):
+        if detected_at.tzinfo is None:
+            detected_at = detected_at.replace(tzinfo=_tz.utc)
+        return detected_at
+    return _dt.min.replace(tzinfo=_tz.utc)

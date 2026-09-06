@@ -79,6 +79,37 @@ class TimelineReadService:
     def engine(self) -> TimelineEngine:
         return self._engine
 
+    def resolve_case_evidence(self, case: Incident) -> Tuple[
+        List[SecurityEvent], List[Any], List[Any]
+    ]:
+        """V2-05: resolve a case's *real* evidence from the stores.
+
+        Returns ``(events, detections, correlations)`` exactly as the
+        timeline builder resolves them: case evidence ids -> persisted
+        records. The centralized-analysis handler uses this so the
+        correlation engine analyses the case's real evidence instead of
+        the (empty) payload the UI happened to send — a no-op analysis
+        that reported a misleading success (V2-05) is impossible when
+        the server owns evidence resolution.
+        """
+        if case is None or not hasattr(case, "evidence"):
+            raise ValidationError(
+                safe_message="invalid case",
+                internal_detail=f"got {type(case).__name__}",
+                field="case",
+            )
+        events = self._resolve_events(case)
+        detections = self._detection_service.list_for_incident(
+            incident_event_ids=tuple(case.evidence.event_ids),
+        )
+        corr_ids = tuple(case.evidence.correlation_ids) + tuple(
+            case.centralized_correlation_ids
+        )
+        correlations = self._correlation_service.list_for_incident(
+            incident_correlation_ids=corr_ids,
+        )
+        return events, detections, correlations
+
     def build_for_incident(
         self,
         *,
@@ -115,20 +146,7 @@ class TimelineReadService:
                 field="case",
             )
 
-        events = self._resolve_events(case)
-        detections = self._detection_service.list_for_incident(
-            incident_event_ids=tuple(case.evidence.event_ids),
-        )
-        # Combine the case's normal correlation_ids with the
-        # centralized ones (the wire contract documents
-        # ``case.centralized_correlation_ids`` as part of the
-        # centralized evidence).
-        corr_ids = tuple(case.evidence.correlation_ids) + tuple(
-            case.centralized_correlation_ids
-        )
-        correlations = self._correlation_service.list_for_incident(
-            incident_correlation_ids=corr_ids,
-        )
+        events, detections, correlations = self.resolve_case_evidence(case)
 
         now = datetime.now(timezone.utc)
         return self._engine.run(

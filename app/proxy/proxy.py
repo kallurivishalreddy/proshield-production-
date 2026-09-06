@@ -39,6 +39,7 @@ from ..rules.management.service import RuleManagementService
 from ..timeline.service import TimelineReadService
 from .errors import (
     InvalidProxyRequestError,
+    ProxyInternalError,
     ProxyRateLimitedError,
     ProxyUnauthorizedError,
 )
@@ -82,6 +83,7 @@ OP_SOURCE_ISSUE_TOKEN = "source.issue_token"
 
 # Phase 3 frontend-required operations: detection, correlation,
 # overview aggregate, timeline, rule management.
+OP_EVENT_LIST = "event.list"
 OP_DETECTION_LIST = "detection.list"
 OP_DETECTION_GET = "detection.get"
 OP_DETECTION_LIST_FOR_INCIDENT = "detection.list_for_incident"
@@ -108,6 +110,7 @@ PROXY_HEADER_CREDENTIAL = "X-ProShield-Credential"
 
 ALLOWED_OPERATIONS: frozenset = frozenset({
     OP_HEALTH,
+    OP_EVENT_LIST,
     OP_GET_CASE,
     OP_CREATE_CASE,
     OP_LIST_CASES,
@@ -491,7 +494,7 @@ class SecureProxy:
                 "proxy.unexpected_error",
                 extra={"operation": request.operation},
             )
-            safe = ProxyUnauthorizedError(
+            safe = ProxyInternalError(
                 safe_message="internal error",
                 internal_detail=f"{type(exc).__name__}: {exc}",
             )
@@ -719,6 +722,8 @@ class SecureProxy:
             return self._handle_source_retire(request, identity)
         if op == OP_SOURCE_ISSUE_TOKEN:
             return self._handle_source_issue_token(request, identity)
+        if op == OP_EVENT_LIST:
+            return self._handle_event_list(request, identity)
         if op == OP_DETECTION_LIST:
             return self._handle_detection_list(request, identity)
         if op == OP_DETECTION_GET:
@@ -822,8 +827,11 @@ class SecureProxy:
         # AUTH-001: require a credential that matches the
         # identity store. Acceptable sources: ``X-ProShield-
         # Credential`` header OR ``credential`` field in the body.
+        # STRIX D-3: real HTTP servers lowercase header keys, so
+        # the credential header lookup must be case-insensitive.
         credential = (
             request.headers.get(PROXY_HEADER_CREDENTIAL)
+            or request.headers.get(PROXY_HEADER_CREDENTIAL.lower())
             or body.get("credential")
         )
         if not isinstance(credential, str) or not credential:
@@ -968,12 +976,47 @@ class SecureProxy:
                 internal_detail="missing incident_id",
                 field="incident_id",
             )
-        # The proxy accepts detections / events as
-        # payload-shaped references (id + minimal
-        # attributes). It NEVER accepts raw pymongo
-        # documents or backend internals.
-        detections = _payload_to_detections(detections_payload)
-        events = _payload_to_events(events_payload)
+        # V2-05 fix: the correlation engine must analyse the case's
+        # REAL evidence, not whatever (typically empty) payload the UI
+        # happened to send. The previous handler derived
+        # ``detections=[]``/``events=[]`` from the request payload,
+        # ran the engine over zero inputs and reported a misleading
+        # success ("0 new correlations"). The server resolves the
+        # case's persisted evidence itself (same resolution the
+        # timeline uses); the payload evidence is only a fallback for
+        # callers that explicitly supply it.
+        if self._timeline_service is not None:
+            case = self._incident_service.get_case(
+                identity=identity, incident_id=incident_id,
+            )
+            resolved_events, resolved_detections, _ = (
+                self._timeline_service.resolve_case_evidence(case)
+            )
+        else:  # pragma: no cover - timeline service is always wired
+            resolved_events, resolved_detections = [], []
+        if detections_payload or events_payload:
+            # The proxy accepts detections / events as
+            # payload-shaped references (id + minimal
+            # attributes). It NEVER accepts raw pymongo
+            # documents or backend internals.
+            detections = _payload_to_detections(detections_payload)
+            events = _payload_to_events(events_payload)
+        else:
+            detections = resolved_detections
+            events = resolved_events
+        if not detections and not events:
+            # Truthful refusal: analysing zero evidence cannot
+            # succeed. The case is left untouched.
+            raise InvalidProxyRequestError(
+                safe_message=(
+                    "case has no evidence to analyse"
+                ),
+                internal_detail=(
+                    "centralized analysis requested with zero resolvable "
+                    f"evidence for incident_id={incident_id!r}"
+                ),
+                field="incident_id",
+            )
         outcome = self._incident_service.request_centralized_analysis(
             identity=identity,
             incident_id=incident_id,
@@ -1063,7 +1106,30 @@ class SecureProxy:
         case = self._incident_service.get_case(
             identity=identity, incident_id=incident_id
         )
+        # V2-02 (report content) fix: the report must describe the
+        # case's REAL evidence. The UI sends only {incident_id}; the
+        # old handler passed the (empty) payload evidence straight
+        # through, so every generated report had empty
+        # what_was_detected / sources / detections / specialized
+        # correlation sections even when the case held a full cluster.
+        # The server resolves the case's persisted evidence itself
+        # (same resolution the timeline uses); a caller-supplied
+        # payload is honoured only when it actually carries evidence.
         evidence = _payload_to_evidence(body)
+        if (
+            not evidence["events"]
+            and not evidence["detections"]
+            and not evidence["correlations"]
+            and self._timeline_service is not None
+        ):
+            (
+                resolved_events,
+                resolved_detections,
+                resolved_correlations,
+            ) = self._timeline_service.resolve_case_evidence(case)
+            evidence["events"] = resolved_events
+            evidence["detections"] = resolved_detections
+            evidence["correlations"] = resolved_correlations
         report = self._report_service.generate_normal_report(
             identity=identity,
             case=case,
@@ -1242,14 +1308,31 @@ class SecureProxy:
                 field="source_type",
             )
         svc = self._require_source_service()
-        view = svc.register(
-            identity=identity,
-            source_type=source_type,
-            display_name=display_name,
-            description=str(body.get("description", "")),
-            tags=tuple(body.get("tags") or ()),
-            asset_tags=tuple(body.get("asset_tags") or ()),
-        )
+        # STRIX F-5 / N-3: normalize tag ordering/duplicates server-side
+        # so a registry with legitimately sorted-unique tags is the ONLY
+        # accepted shape, and escape a Pydantic ValidationError to 400
+        # (not the 401 internal-error path) if anything else is invalid.
+        try:
+            view = svc.register(
+                identity=identity,
+                source_type=source_type,
+                display_name=display_name,
+                description=str(body.get("description", "")),
+                tags=_normalize_tags(body.get("tags")),
+                asset_tags=_normalize_tags(body.get("asset_tags")),
+            )
+        except DomainValidationError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "proxy.source_register_validation",
+                extra={"error_type": type(exc).__name__},
+            )
+            raise InvalidProxyRequestError(
+                safe_message="source registration validation failed",
+                internal_detail=f"{type(exc).__name__}: {exc}"[:256],
+                field="tags",
+            )
         return self._shape_ok({"source": self._view_to_dict(view)})
 
     def _handle_source_configure(
@@ -1288,8 +1371,8 @@ class SecureProxy:
                 endpoint=str(cfg.get("endpoint", "")),
                 proxy_path=str(cfg.get("proxy_path", "")),
                 destination=str(cfg.get("destination", "")),
-                asset_tags=tuple(cfg.get("asset_tags") or ()),
-                tags=tuple(cfg.get("tags") or ()),
+                asset_tags=_normalize_tags(cfg.get("asset_tags")),
+                tags=_normalize_tags(cfg.get("tags")),
                 references=tuple(cfg.get("references") or ()),
                 secret_ref=str(cfg.get("secret_ref", "")),
             )
@@ -1478,6 +1561,75 @@ class SecureProxy:
                 internal_detail="proxy not wired",
             )
         return svc
+
+    def _handle_event_list(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """V2-06: analyst visibility for persisted SecurityEvents.
+
+        A valid, trusted event that matched **no** rule was previously
+        invisible to the analyst (persisted in Mongo but unreachable by
+        any wire op or page). This bounded read surface returns the
+        most recent events; with ``unmatched=true`` it returns only the
+        events that produced no detection — the documented human-review
+        obligation for unmatched-but-valid events. No severity or
+        escalation is invented: unmatched events are surfaced as
+        evidence for analyst review, which is what the specification
+        requires of the MVP.
+        """
+        self._require(identity, Permission.EVENT_READ)
+        repo = self._security_event_repository
+        if repo is None:
+            raise InvalidProxyRequestError(
+                safe_message="event repository unavailable",
+                internal_detail="proxy not wired",
+            )
+        body = request.body or {}
+        limit = body.get("limit")
+        unmatched = body.get("unmatched")
+        source_instance_id = body.get("source_instance_id")
+        bounded_limit = (
+            limit if isinstance(limit, int) and 0 < limit <= 200 else 50
+        )
+        events = repo.find_recent(
+            limit=bounded_limit,
+            source_instance_id=(
+                source_instance_id
+                if isinstance(source_instance_id, str)
+                and source_instance_id
+                else None
+            ),
+        )
+        matched_event_ids: set = set()
+        if unmatched:
+            if self._detection_service is not None:
+                recent = self._detection_service.repository.find_latest(
+                    limit=500,
+                )
+                matched_event_ids = {
+                    d.event_id for d in recent if d.event_id
+                }
+            events = [e for e in events if e.event_id not in matched_event_ids]
+        return self._shape_ok({
+            "events": [
+                {
+                    "event_id": e.event_id,
+                    "event_time": e.event_time.isoformat(),
+                    "source": e.source,
+                    "event_type": e.event_type,
+                    "source_ip": e.source_ip,
+                    "endpoint": e.endpoint,
+                    "asset": e.asset,
+                    "source_instance_id": (
+                        getattr(e.provenance, "source_instance_id", None)
+                        if e.provenance is not None
+                        else None
+                    ),
+                }
+                for e in events
+            ],
+            "count": len(events),
+        })
 
     def _handle_detection_list(
         self, request: ProxyRequest, identity: Identity
@@ -1980,6 +2132,30 @@ def _payload_to_detections(payload: Any) -> List[Any]:
     return out
 
 
+def _normalize_tags(value: Any) -> Tuple[str, ...]:
+    """Normalize arbitrary client tag input to a sorted-unique tuple.
+
+    STRIX F-5 / N-3: the source model requires unique, sorted tags. A
+    client may send them in any order (or with duplicates); normalizing
+    at the wire boundary keeps the model authoritative while removing a
+    spurious 401-vs-400 classification. Non-string, empty members are
+    dropped; bounds are enforced by the model itself.
+    """
+    if not isinstance(value, (list, tuple)):
+        return ()
+    seen: set = set()
+    out: List[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        item = item.strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return tuple(sorted(out))
+
+
 def _payload_to_correlations(payload: Any) -> List[Any]:
     """Translate a JSON-shaped correlations payload into
     :class:`Correlation` instances."""
@@ -2086,6 +2262,7 @@ __all__ = [
     "OP_LIST_CASES",
     "OP_LIST_REPORTS",
     "OP_REQUEST_CENTRALIZED",
+    "OP_EVENT_LIST",
     "OP_ROUTE_CASE",
     "OP_SOURCE_CONFIGURE",
     "OP_SOURCE_DISABLE",

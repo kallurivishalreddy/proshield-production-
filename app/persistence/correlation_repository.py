@@ -249,6 +249,74 @@ class CorrelationRepository:
             return None
         return _document_to_correlation(doc)
 
+    def upsert_growth(self, correlation: Correlation) -> Correlation:
+        """Grow the stored cluster row to the newest evidence (V2-08).
+
+        The correlation_id now identifies the *logical cluster*
+        (signature-derived, stable as the cluster grows). When a
+        freshly evaluated correlation for the same signature carries a
+        wider window / larger detection-event set than the stored row,
+        this method replaces the moving fields in place — **without
+        changing the row's identity** and without touching the
+        original ``correlated_at`` (first-observed bookkeeping).
+
+        Returns the merged :class:`Correlation`. Insert-new when no
+        row exists yet (same guarantee as :meth:`create`).
+        """
+        if not isinstance(correlation, Correlation):
+            raise ValidationError(
+                safe_message="upsert_growth() requires a Correlation",
+                internal_detail=f"got {type(correlation).__name__}",
+            )
+        existing = self.get_by_correlation_id(correlation.correlation_id)
+        if existing is None:
+            return self.create(correlation)
+        merged_ids = sorted(
+            set(existing.detection_ids) | set(correlation.detection_ids)
+        )
+        merged_events = sorted(
+            set(existing.event_ids) | set(correlation.event_ids)
+        )
+        window_start = min(existing.window_start, correlation.window_start)
+        window_end = max(existing.window_end, correlation.window_end)
+        # The count is the number of distinct events in the merged set.
+        count = max(existing.count, correlation.count, len(merged_events))
+        update: Dict[str, Any] = {
+            "detection_ids": merged_ids,
+            "event_ids": merged_events,
+            "window_start": window_start,
+            "window_end": window_end,
+            "count": count,
+            "reasoning": correlation.reasoning or existing.reasoning,
+        }
+        try:
+            self._collection.update_one(
+                {"correlation_id": correlation.correlation_id},
+                {"$set": update},
+            )
+        except PyMongoError as exc:
+            raise PersistenceError(
+                safe_message="could not update correlation evidence",
+                internal_detail=(
+                    f"update_one failed: {type(exc).__name__}"
+                ),
+            ) from exc
+        # Best-effort: keep the in-memory instance consistent with the
+        # persisted row for the caller (case evidence merge).
+        try:
+            from .models import MAX_CORRELATION_DETECTIONS as _MAX
+
+            return correlation.model_copy(update={
+                "detection_ids": tuple(merged_ids),
+                "event_ids": tuple(merged_events),
+                "window_start": window_start,
+                "window_end": window_end,
+                "count": min(count, _MAX),
+                "reasoning": update["reasoning"],
+            })
+        except Exception:  # noqa: BLE001 - merged view is best-effort
+            return existing
+
     def find_by_pattern(
         self, pattern_id: str, *, pattern_version: Optional[int] = None
     ) -> List[Correlation]:
@@ -279,6 +347,35 @@ class CorrelationRepository:
             raise PersistenceError(
                 safe_message="could not read correlations by pattern",
                 internal_detail=f"find failed: {type(exc).__name__}",
+            ) from exc
+        return [_document_to_correlation(d) for d in docs]
+
+    def find_recent(self, *, limit: int = 50) -> List[Correlation]:
+        """Return the most recent correlations ordered by
+        ``window_start`` descending.
+
+        Used by the unfiltered ``correlation.list`` path so an analyst
+        can see the latest correlation clusters without specifying a
+        ``pattern_id`` (F-3). The collection is indexed on
+        ``window_start`` for this read pattern.
+        """
+        if not isinstance(limit, int) or limit < 1 or limit > 1000:
+            raise ValidationError(
+                safe_message="invalid limit",
+                internal_detail=(
+                    f"limit must be int in [1, 1000], got {limit!r}"
+                ),
+                field="limit",
+            )
+        try:
+            cursor = self._collection.find({}).sort(
+                "window_start", DESCENDING
+            ).limit(limit)
+            docs = list(cursor)
+        except PyMongoError as exc:
+            raise PersistenceError(
+                safe_message="could not read correlations",
+                internal_detail=f"find_recent failed: {type(exc).__name__}",
             ) from exc
         return [_document_to_correlation(d) for d in docs]
 

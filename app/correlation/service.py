@@ -95,7 +95,11 @@ class CorrelationReadService:
         if pattern_id is not None:
             rows = self._repository.find_by_pattern(pattern_id)
         else:
-            return []
+            # F-3: an unfiltered ``correlation.list`` must show the
+            # latest clusters (analyst overview). Previously it always
+            # returned [] when no pattern_id was supplied, so the
+            # frontend Correlations page could never list live data.
+            rows = self._repository.find_recent(limit=effective_limit)
         if since is not None:
             rows = [c for c in rows if c.window_start >= since]
         if until is not None:

@@ -113,7 +113,15 @@ class TestAllowedTransitionsExhaustive:
 
 class TestSupportedConnectorTypes:
     def test_supported_set_is_locked(self) -> None:
-        assert SUPPORTED_CONNECTOR_TYPES == frozenset(SourceType)
+        # F-6: only implemented connector types are supported. The
+        # SourceType enum declares a wider possible set, but the
+        # supported/implemented set is locked to what the product can
+        # actually ingest + evaluate today.
+        assert SUPPORTED_CONNECTOR_TYPES == frozenset({
+            SourceType.NGINX,
+            SourceType.SIMULATOR,
+        })
+        assert SourceType.WAF not in SUPPORTED_CONNECTOR_TYPES
 
     def test_supported_list_is_sorted(self) -> None:
         types = supported_connector_types()

@@ -380,7 +380,7 @@ class TestGetAndList:
         )
         svc.register(
             identity=_ADMIN,
-            source_type=SourceType.WAF,
+            source_type=SourceType.SIMULATOR,
             display_name="Staging",
         )
         views = svc.list_all()
@@ -390,7 +390,8 @@ class TestGetAndList:
         svc = _service()
         types = svc.list_supported_connector_types()
         assert SourceType.NGINX in types
-        assert SourceType.WAF in types
+        assert SourceType.SIMULATOR in types
+        assert SourceType.WAF not in types
 
 
 class TestReloadFromRepository:

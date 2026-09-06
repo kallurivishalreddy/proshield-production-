@@ -84,12 +84,19 @@ class DetectionReadService:
         if rule_id is not None and event_id is not None:
             rows = self._repository.find_by_rule(rule_id)
             rows = [d for d in rows if d.event_id == event_id]
+            rows = sorted(rows, key=lambda d: d.detected_at, reverse=True)
         elif rule_id is not None:
             rows = self._repository.find_by_rule(rule_id)
+            rows = sorted(rows, key=lambda d: d.detected_at, reverse=True)
         elif event_id is not None:
             rows = self._repository.find_by_event_id(event_id)
+            rows = sorted(rows, key=lambda d: d.detected_at, reverse=True)
         else:
-            return []
+            # V2-04/V2-06 adjacent fix: an unfiltered ``detection.list``
+            # is the *recent detections* view. Returning a fabricated
+            # empty list made the detections page (and the health
+            # probe) lie about a populated store.
+            return self._repository.find_latest(limit=effective_limit)
         return rows[:effective_limit]
 
     def get(self, detection_id: str) -> Detection:

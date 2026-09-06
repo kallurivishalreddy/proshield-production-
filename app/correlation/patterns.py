@@ -163,9 +163,6 @@ def _build_correlation_id(
     pattern_version: int,
     trigger: str,
     key_parts: Tuple[str, ...],
-    window_start: datetime,
-    window_end: datetime,
-    detection_ids: Sequence[str],
 ) -> str:
     """Build a deterministic ``corr-<uuidv7>`` correlation_id.
 
@@ -174,23 +171,29 @@ def _build_correlation_id(
     concatenation, formatted as a UUIDv7 (RFC 9562) with the
     ``corr-`` prefix.
 
-    Why deterministic: the same pattern + key + window + set of
-    detection ids always produces the same correlation_id. This
-    is the audit-friendly invariant that the Phase 4.4 review
-    identified for ``detection_id`` (D-2 fix). It also makes the
-    engine replay-safe: running the same batch twice produces
-    the same correlation_ids.
+    Why deterministic: the same cluster signature always produces the
+    same correlation_id, so re-running the same batch is replay-safe.
+
+    V2-08 fix — **stable logical-cluster identity.** The digest is a
+    pure function of the cluster *signature* (``pattern_id``,
+    ``pattern_version``, ``trigger``, ``key_parts``) and deliberately
+    NOT of the moving window bounds or the exact detection-id set.
+    The previous construction folded ``window_start`` / ``window_end``
+    / ``detection_ids`` into the digest, so a growing brute-force
+    cluster produced a **new correlation_id (a new row, and a new
+    case reference) every time another detection joined** — the
+    proliferation the V2 audit measured (2 correlation rows for one
+    logical cluster). With the signature-only digest a growing
+    cluster keeps the *same* correlation_id; its evidence (window
+    bounds, detection/event id sets) still grows on the single row
+    via :meth:`CorrelationRepository.upsert_growth`.
     """
-    sorted_dets = sorted(detection_ids)
     blob = "|".join(
         [
             pattern_id,
             str(pattern_version),
             trigger,
             "|".join(key_parts),
-            window_start.isoformat(),
-            window_end.isoformat(),
-            "|".join(sorted_dets),
         ]
     ).encode("utf-8")
     digest = hashlib.sha256(blob).digest()
@@ -374,9 +377,6 @@ class BruteForceClusteringPattern(CorrelationPattern):
                 pattern_version=self.pattern_version,
                 trigger=trigger,
                 key_parts=(source_ip, endpoint_key),
-                window_start=earliest,
-                window_end=latest,
-                detection_ids=det_ids,
             )
             correlation = Correlation(
                 correlation_id=correlation_id,

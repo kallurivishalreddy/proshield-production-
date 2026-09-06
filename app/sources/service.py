@@ -35,6 +35,8 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from pydantic import ValidationError as PydanticValidationError
+
 from ..auth.identity import Identity
 from ..auth.permissions import (
     ADMIN_ROLE,
@@ -198,33 +200,48 @@ class SourceManagementService:
         if now is None:
             now = _utcnow()
         sid_id = _make_source_instance_id(display_name)
-        cfg = SourceInstanceConfiguration(
-            connection_type=SourceConnectionType.PUSH,
-            endpoint="https://pending.invalid",
-            proxy_path="",
-            destination="",
-            asset_tags=tuple(asset_tags),
-            tags=tuple(tags),
-            references=(),
-            secret_ref="",
-        )
-        inst = SourceInstance(
-            source_instance_id=sid_id,
-            source_type=source_type,
-            source=source_string_for_type(source_type),
-            display_name=display_name,
-            description=description,
-            configuration=cfg,
-            state=SourceState.REGISTERED,
-            created_by=identity.subject_id,
-            created_at=now,
-            updated_by=identity.subject_id,
-            updated_at=now,
-            last_validation_at=None,
-            tags=tuple(tags),
-            asset_tags=tuple(asset_tags),
-            retired_at=None,
-        )
+        # STRIX F-5 / N-3: normalize tag ordering/duplicates at the
+        # owning layer and convert any Pydantic ValidationError to a
+        # deterministic 400 ``source_configuration_error`` instead of
+        # letting it escape to the proxy's generic (mis-)fallback.
+        try:
+            norm_asset_tags = _normalize_tag_tuple(asset_tags)
+            norm_tags = _normalize_tag_tuple(tags)
+            cfg = SourceInstanceConfiguration(
+                connection_type=SourceConnectionType.PUSH,
+                endpoint="https://pending.invalid",
+                proxy_path="",
+                destination="",
+                asset_tags=norm_asset_tags,
+                tags=norm_tags,
+                references=(),
+                secret_ref="",
+            )
+            inst = SourceInstance(
+                source_instance_id=sid_id,
+                source_type=source_type,
+                source=source_string_for_type(source_type),
+                display_name=display_name,
+                description=description,
+                configuration=cfg,
+                state=SourceState.REGISTERED,
+                created_by=identity.subject_id,
+                created_at=now,
+                updated_by=identity.subject_id,
+                updated_at=now,
+                last_validation_at=None,
+                tags=norm_tags,
+                asset_tags=norm_asset_tags,
+                retired_at=None,
+            )
+        except PydanticValidationError as exc:
+            raise SourceConfigurationError(
+                safe_message="source validation failed",
+                internal_detail=(
+                    f"pydantic raised {type(exc).__name__} with "
+                    f"{len(exc.errors())} error(s)"
+                ),
+            ) from exc
         persisted = self._repository.create(inst)
         self._registry.register(persisted)
         return persisted.to_view()
@@ -558,6 +575,30 @@ def _require_role(identity: Identity, role: str) -> None:
                 safe_message="source write denied",
                 internal_detail="missing source:write permission",
             )
+
+
+def _normalize_tag_tuple(tags) -> Tuple[str, ...]:
+    """Return a sorted, de-duplicated, string-only tag tuple.
+
+    STRIX F-5 / N-3: the source model requires unique, sorted tags.
+    Normalizing at the owning layer means unsorted/duplicate input can
+    no longer escape as a pydantic error into the proxy's fail-safe
+    boundary. Non-string, empty members are dropped; persistence bounds
+    are enforced by the model itself.
+    """
+    if not isinstance(tags, (tuple, list)):
+        return ()
+    seen = set()
+    out = []
+    for t in tags:
+        if not isinstance(t, str):
+            continue
+        t = t.strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return tuple(sorted(out))
 
 
 __all__ = [

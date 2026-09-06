@@ -340,6 +340,12 @@ Purpose: SOC posture at a glance (counts, sources, health).
 - **Request:** `{ "source_type": "nginx", "display_name": "<text>", "description": "<text>", "tags": [...], "asset_tags": [...] }`
 - **Response:** `{ "ok": true, "data": { "source": SourceInstanceView (state=registered) } }`
 - **Service:** `SourceManagementService.register` (`app/sources/service.py:177-...`)
+- **Field constraints (STRIX D-5 documentation):**
+  - `tags`: 1..64 chars each, pattern `^[A-Z][A-Z0-9_-]*$` (uppercase start, then uppercase/digits/underscore/hyphen). A violation returns 400 (`tag_format_error` envelope from the Pydantic validation layer). Example valid tag: `PROD`, `NGINX-EDGE`; invalid: `strix-test` (lowercase).
+  - `asset_tags`: 1..64 chars each, pattern `^[a-z][a-z0-9_-]*$` (lowercase start). Example: `web`, `api`.
+  - max 16 tags and 16 asset_tags per source; tags must be unique and sorted.
+  - `display_name`: 1..128 chars.
+- **Lifecycle error codes (STRIX D-6 documentation):** ingest against a DISABLED source returns 409; ingest against a RETIRED source returns **410 Gone** (retire is terminal; the resource is permanently removed from the enabled lifecycle, not merely conflicting).
 
 ### Action 6.5: Configure source
 

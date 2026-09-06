@@ -47,6 +47,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from ..config import ProShieldConfig
 from ..domain.errors import (
     DomainError,
+    PersistenceError,
     ValidationError as DomainValidationError,
 )
 from ..domain.security_event import (
@@ -329,6 +330,14 @@ class InboundIngressProxy:
             return _error_response(
                 exc.code, exc.safe_message, status=exc.http_status,
             )
+        except PersistenceError as exc:  # fail-closed: an unavailable
+            # replay store must NOT degrade into accept-without-replay-
+            # protection; it is a 503 so the caller may retry later.
+            return _error_response(
+                "replay_store_unavailable",
+                "source identity replay store unavailable",
+                status=503,
+            )
         # D-3: prefer the authoritative resolver (MongoDB) over the
         # in-memory registry. A stale registry must NOT be able to
         # authorize an ingest that the persisted state forbids.
@@ -600,18 +609,18 @@ class InboundIngressProxy:
             else registered_asset
         )
         client_source_ip = _opt_str(raw.get("source_ip"), 64)
-        # ``source_ip`` is observable by the trusted network
-        # edge in real deployments; we keep the client value
-        # but record an untrusted flag if the registered
-        # source has a known egress that disagrees. Most
-        # sources have no registered egress, so the value is
-        # accepted as-is.
-        if client_source_ip is not None and (
-            client_endpoint is not None
-            and client_endpoint != registered_endpoint
-        ):
-            details["_untrusted_source_ip"] = client_source_ip
-            client_source_ip = None
+        # V2-19 fix: ``source_ip`` is the *attacker* attribution field
+        # observed by the authenticated external source — it does not
+        # describe the source system, so it is NOT reconciled against
+        # the registered endpoint of the source instance. The previous
+        # implementation nulled ``source_ip`` whenever the wire
+        # endpoint disagreed with the registered configuration
+        # endpoint, which silently broke every correlation that groups
+        # by ``source_ip`` (BruteForceClusteringPattern) for realistic
+        # telemetry whose wire path differs from the configured one —
+        # a systematic false-negative. The endpoint mismatch itself is
+        # still recorded under ``details._untrusted_endpoint`` for the
+        # analyst; the attacker IP is preserved as evidence.
         if client_asset is not None and reconciled_asset is None:
             details["_untrusted_asset"] = client_asset
         if (
@@ -645,13 +654,38 @@ class InboundIngressProxy:
         return ev
 
 
+def _first_ci_header(
+    headers: Mapping[str, str], *names: str,
+) -> Optional[str]:
+    """Return the first value among ``names`` matched case-insensitively.
+
+    HTTP/1.1 field names are case-insensitive; a conforming server
+    (Starlette / FastAPI / uvicorn / any reverse proxy) lowercases
+    them, but a direct client may preserve any casing.  Scanning
+    with a case-folded compare is the robust way to honour both.
+    """
+    wanted = {name.lower() for name in names}
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() in wanted:
+            return value
+    return None
+
+
 def _extract_token(
     headers: Mapping[str, str],
     body: Optional[Dict[str, Any]],
 ) -> str:
-    """Extract the source-identity token from headers / body."""
-    auth = headers.get(INGRESS_HEADER_AUTHORIZATION) or headers.get(
-        INGRESS_HEADER_TOKEN
+    """Extract the source-identity token from headers / body.
+
+    STRIX D-2 fix: real HTTP listeners (Starlette / FastAPI /
+    uvicorn / gunicorn / every reverse proxy) lowercase header
+    keys per HTTP/1.1, and direct clients may preserve any casing.
+    The lookup is therefore case-insensitive for both supported
+    header names, mirroring ``SecureProxy._extract_session_token``
+    (app/proxy/proxy.py).
+    """
+    auth = _first_ci_header(
+        headers, INGRESS_HEADER_AUTHORIZATION, INGRESS_HEADER_TOKEN,
     )
     if isinstance(auth, str) and auth:
         if auth.lower().startswith("bearer "):

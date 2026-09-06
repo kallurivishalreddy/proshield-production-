@@ -42,9 +42,22 @@ class InvalidProxyRequestError(ValidationError):
     """The proxy request failed validation."""
 
 
+class ProxyInternalError(ProxyError):
+    """An unexpected internal failure escaped the fail-safe boundary.
+
+    ``code="internal_error"`` and ``http_status=500`` so the wire
+    never labels an internal failure as an authentication failure
+    (STRIX F-7 / N-3).
+    """
+
+    code = "internal_error"
+    http_status = 500
+
+
 __all__ = [
     "InvalidProxyRequestError",
     "ProxyError",
+    "ProxyInternalError",
     "ProxyRateLimitedError",
     "ProxyUnauthorizedError",
 ]

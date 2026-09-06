@@ -56,6 +56,35 @@ python -m pytest           # everything (requires MongoDB)
 python -m pytest tests/unit  # no infrastructure needed
 ```
 
+## Run the deployment listeners (Phase 4.10 / STRIX patch)
+
+Two separate planes, two separate processes:
+
+```text
+# Analyst plane  (frontend + 40-op wire boundary, session-token gated)
+python -m scripts.proxy_server --host 127.0.0.1 --port 8088 --backend mongo
+# Frontend:      http://127.0.0.1:8088/static/login.html
+# Wire boundary: http://127.0.0.1:8088/api/proxy
+
+# Ingress plane  (trusted inbound telemetry, source-identity-token gated)
+python -m scripts.ingress_server --host 127.0.0.1 --port 8089 --backend mongo
+# Ingest:         POST http://127.0.0.1:8089/api/ingress
+# Health:         GET  http://127.0.0.1:8089/api/ingress/health
+```
+
+* `--backend mongo` wires the real MongoDB repositories and the
+  production `MongoReplayStore` (`app/sources/replay_store.py`) which
+  enforces single-use source-identity tokens across processes with a
+  TTL index. Production deployments MUST use `--backend mongo`.
+* `--backend memory` wires in-memory fakes plus a process-local
+  replay double — for development only; it is NOT cross-process safe.
+* Both planes MUST share `PROSHIELD_SOURCE_SIGNING_KEY` so a token
+  issued by `source.issue_token` on the analyst plane verifies at the
+  ingress boundary.
+* The ingress plane never serves the frontend and never exposes
+  analyst operations; the analyst plane never accepts raw source
+  telemetry.
+
 Current results on this machine: **79 passed in 4.98s** (61 unit
 + 18 integration, against real local MongoDB).
 

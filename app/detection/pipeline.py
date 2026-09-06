@@ -29,6 +29,18 @@ _log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class DetectionPersistFailure:
+    """V2-10: an observable record of a detection that matched but
+    could not be persisted. Never silently dropped: the pipeline
+    includes it in :attr:`PipelineResult.persist_failures` and the
+    live pipeline surfaces it on :attr:`PipelineRunOutcome.errors`."""
+
+    detection_id: str
+    safe_message: str
+    error_code: str
+
+
+@dataclass(frozen=True)
 class PipelineResult:
     """The output of one :meth:`DetectionPipeline.run` call.
 
@@ -43,11 +55,16 @@ class PipelineResult:
         The list of detections successfully persisted. A
         detection that failed to persist is **not** in this
         list (the pipeline logged the failure).
+    persist_failures:
+        V2-10: the detections that matched but could not be
+        persisted, as :class:`DetectionPersistFailure`
+        records. Empty in the normal path.
     """
 
     event: SecurityEvent
     detection_result: DetectionResult
     persisted_detections: List[Detection]
+    persist_failures: tuple = ()
 
 
 class DetectionPipeline:
@@ -100,8 +117,16 @@ class DetectionPipeline:
         event: SecurityEvent,
         *,
         now: Optional[datetime] = None,
+        event_persisted: bool = False,
     ) -> PipelineResult:
         """Run the full per-event pipeline on one canonical event.
+
+        ``event_persisted`` (V2-23): when ``True`` the caller asserts
+        this exact event is already persisted (the live ingress path
+        loads it from the event store); the ingestion step is then
+        skipped. Re-running ingestion on a persisted event is what
+        produced the double ``security_events`` rows the V2 audit
+        observed when the unique index was absent.
 
         The pipeline:
 
@@ -135,7 +160,10 @@ class DetectionPipeline:
             Contains the persisted event, the engine result,
             and the list of persisted detections.
         """
-        persisted_event = self._ingestion.ingest(event)
+        if event_persisted:
+            persisted_event = event
+        else:
+            persisted_event = self._ingestion.ingest(event)
         # Default ``now`` to the event's observed
         # ``event_time`` (the source's timestamp) so
         # the detection's ``detected_at`` and
@@ -151,6 +179,7 @@ class DetectionPipeline:
             now = persisted_event.event_time
         detection_result = self._engine.run(persisted_event, now=now)
         persisted: List[Detection] = []
+        failures: List[DetectionPersistFailure] = []
         for detection in detection_result.detections:
             try:
                 self._repo.create(detection)
@@ -166,11 +195,20 @@ class DetectionPipeline:
                         "safe_message": exc.safe_message,
                     },
                 )
+                # V2-10: observable, not silent.
+                failures.append(
+                    DetectionPersistFailure(
+                        detection_id=detection.detection_id,
+                        safe_message=str(exc.safe_message),
+                        error_code=str(getattr(exc, "code", "")),
+                    )
+                )
                 continue
         return PipelineResult(
             event=persisted_event,
             detection_result=detection_result,
             persisted_detections=persisted,
+            persist_failures=tuple(failures),
         )
 
     def run_from_connector(

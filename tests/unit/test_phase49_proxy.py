@@ -86,6 +86,31 @@ def _token(proxy: SecureProxy, subject_id: str) -> str:
     )).body["data"]["token"]
 
 
+def _identity_store_with_collector() -> InMemoryIdentityStore:
+    """Same as ``_identity_store`` but with a ``collector`` identity.
+
+    Collector is the lowest-privilege role (RBAC-001) and is
+    expected to be denied every source write. Adding a third
+    identity here keeps the regression test orthogonal to the
+    other role-based tests.
+    """
+    return InMemoryIdentityStore({
+        "user-analyst-001": Identity(
+            subject_id="user-analyst-001", role=ANALYST_ROLE,
+        ),
+        "user-admin-001": Identity(
+            subject_id="user-admin-001", role=ADMIN_ROLE,
+        ),
+        "user-collector-001": Identity(
+            subject_id="user-collector-001", role="collector",
+        ),
+    }, credentials={
+        "user-analyst-001": "analyst-password",
+        "user-admin-001": "admin-password",
+        "user-collector-001": "collector-password",
+    })
+
+
 def _proxy_with_source_service() -> SecureProxy:
     proxy = SecureProxy(
         config=_config(),
@@ -103,6 +128,39 @@ def _proxy_with_source_service() -> SecureProxy:
     )
     proxy.attach_source_management_service(svc)
     return proxy
+
+
+def _proxy_with_collector() -> SecureProxy:
+    """Proxy + source service + a collector identity."""
+    proxy = SecureProxy(
+        config=_config(),
+        identity_store=_identity_store_with_collector(),
+    )
+    issuer = SourceIdentityTokenIssuer(
+        secret=proxy._config.source_signing_key,
+        lifetime_seconds=3600,
+    )
+    repo = SourceRepository(FakeDatabase(), proxy._config)
+    registry = SourceRegistry()
+    svc = SourceManagementService(
+        repository=repo, registry=registry,
+        token_issuer=issuer,
+    )
+    proxy.attach_source_management_service(svc)
+    return proxy
+
+
+def _token_any(proxy: SecureProxy, subject_id: str) -> str:
+    """Like ``_token`` but supports the collector fixture too."""
+    password = {
+        "user-analyst-001": "analyst-password",
+        "user-admin-001": "admin-password",
+        "user-collector-001": "collector-password",
+    }[subject_id]
+    return proxy.handle(ProxyRequest(
+        operation=OP_AUTH_ISSUE, headers={},
+        body={"subject_id": subject_id, "credential": password},
+    )).body["data"]["token"]
 
 
 class TestProxySourceAttach:
@@ -167,8 +225,11 @@ class TestProxySourceList:
         ))
         assert resp.status == 200
         types = resp.body["data"]["supported_connector_types"]
+        # F-6: only implemented connector types are advertised.
         assert "nginx" in types
-        assert "waf" in types
+        assert "simulator" in types
+        assert "waf" not in types
+        assert "iam" not in types
 
 
 class TestProxySourceLifecycle:
@@ -310,38 +371,252 @@ class TestProxySourceLifecycle:
         sid = self._register(proxy, admin_token)
         proxy.handle(ProxyRequest(
             operation=OP_SOURCE_CONFIGURE,
-            headers={
-                PROXY_HEADER_AUTHORIZATION: f"Bearer {admin_token}",
-            },
-            body={
-                "source_instance_id": sid,
-                "configuration": {
-                    "connection_type": "push",
-                    "endpoint": "https://example.com/api/ingest",
-                },
-            },
-        ))
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin_token}"},
+            body={"source_instance_id": sid,
+                  "configuration": {
+                      "connection_type": "push",
+                      "endpoint":
+                          "https://example.com/api/ingest"}}))
         proxy.handle(ProxyRequest(
             operation=OP_SOURCE_VALIDATE,
-            headers={
-                PROXY_HEADER_AUTHORIZATION: f"Bearer {admin_token}",
-            },
-            body={"source_instance_id": sid},
-        ))
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin_token}"},
+            body={"source_instance_id": sid}))
         proxy.handle(ProxyRequest(
             operation=OP_SOURCE_ENABLE,
-            headers={
-                PROXY_HEADER_AUTHORIZATION: f"Bearer {admin_token}",
-            },
-            body={"source_instance_id": sid},
-        ))
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin_token}"},
+            body={"source_instance_id": sid}))
         resp = proxy.handle(ProxyRequest(
             operation=OP_SOURCE_ISSUE_TOKEN,
-            headers={
-                PROXY_HEADER_AUTHORIZATION: f"Bearer {admin_token}",
-            },
-            body={"source_instance_id": sid},
-        ))
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin_token}"},
+            body={"source_instance_id": sid}))
         assert resp.status == 200
         packed = resp.body["data"]["source_token"]
         assert len(packed.split(".")) == 3
+
+
+# --------------------------------------------------------------- RBAC regression
+# The following tests lock in the source-management RBAC
+# policy: ``source:write`` is admin-only. The manual E2E
+# found that an analyst hit a 403 on ``source.register``;
+# that 403 is the correct answer (see Phase 4.9 RBAC and
+# app/auth/permissions.py). These tests cover the full
+# surface (write + read + closed set + role defaults) for
+# admin, analyst, and collector.
+SOURCE_RBAC_WRITE_OPS = [
+    (OP_SOURCE_REGISTER, {
+        "source_type": "nginx",
+        "display_name": "Prod Nginx",
+    }),
+    (OP_SOURCE_CONFIGURE, {
+        "source_instance_id": "src-doesnt-matter",
+        "configuration": {
+            "connection_type": "push",
+            "endpoint": "https://example.com/api/ingest",
+        },
+    }),
+    (OP_SOURCE_VALIDATE, {"source_instance_id": "src-doesnt-matter"}),
+    (OP_SOURCE_ENABLE, {"source_instance_id": "src-doesnt-matter"}),
+    (OP_SOURCE_DISABLE, {"source_instance_id": "src-doesnt-matter"}),
+    (OP_SOURCE_RETIRE, {"source_instance_id": "src-doesnt-matter"}),
+    (OP_SOURCE_ISSUE_TOKEN, {"source_instance_id": "src-doesnt-matter"}),
+]
+
+
+class TestSourceWriteOpsAreAdminOnly:
+    """Every source write op must be denied to non-admin tokens."""
+
+    @pytest.mark.parametrize("op,body", SOURCE_RBAC_WRITE_OPS)
+    def test_analyst_is_forbidden(self, op: str, body: dict) -> None:
+        proxy = _proxy_with_collector()
+        token = _token_any(proxy, "user-analyst-001")
+        resp = proxy.handle(ProxyRequest(
+            operation=op,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {token}"},
+            body=body))
+        assert resp.status == 403, (
+            f"analyst was allowed to call {op}: "
+            f"status={resp.status}, body={resp.body}")
+        assert resp.body.get("error", {}).get("code") == "forbidden"
+
+    @pytest.mark.parametrize("op,body", SOURCE_RBAC_WRITE_OPS)
+    def test_collector_is_forbidden(self, op: str, body: dict) -> None:
+        proxy = _proxy_with_collector()
+        token = _token_any(proxy, "user-collector-001")
+        resp = proxy.handle(ProxyRequest(
+            operation=op,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {token}"},
+            body=body))
+        assert resp.status == 403, (
+            f"collector was allowed to call {op}: "
+            f"status={resp.status}, body={resp.body}")
+        assert resp.body.get("error", {}).get("code") == "forbidden"
+
+
+class TestAdminFullLifecycleRbac:
+    """End-to-end happy path: admin can register, configure,
+    validate, enable, disable, re-enable, retire. The
+    resulting source shows up in source.list with the
+    user-chosen source_type. This proves a nginx
+    registration lands as nginx, not iam."""
+
+    def test_full_lifecycle_with_nginx(self) -> None:
+        proxy = _proxy_with_source_service()
+        admin = _token(proxy, "user-admin-001")
+        # REGISTER
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_SOURCE_REGISTER,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin}"},
+            body={"source_type": "nginx",
+                  "display_name": "Prod Nginx",
+                  "description": "frontend",
+                  "tags": ["PROD"],
+                  "asset_tags": ["web-app"]}))
+        assert resp.status == 200, resp.body
+        sid = resp.body["data"]["source"]["source_instance_id"]
+        assert resp.body["data"]["source"]["source_type"] == "nginx"
+        assert resp.body["data"]["source"]["state"] == "registered"
+        # CONFIGURE
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_SOURCE_CONFIGURE,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin}"},
+            body={"source_instance_id": sid,
+                  "configuration": {
+                      "connection_type": "push",
+                      "endpoint":
+                          "https://example.com/api/ingest"}}))
+        assert resp.status == 200
+        assert resp.body["data"]["source"]["state"] == "configured"
+        # VALIDATE
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_SOURCE_VALIDATE,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin}"},
+            body={"source_instance_id": sid}))
+        assert resp.status == 200
+        assert resp.body["data"]["source"]["state"] == "validated"
+        # ENABLE
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_SOURCE_ENABLE,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin}"},
+            body={"source_instance_id": sid}))
+        assert resp.status == 200
+        assert resp.body["data"]["source"]["state"] == "enabled"
+        # LIST (analyst is allowed)
+        analyst = _token(proxy, "user-analyst-001")
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_SOURCE_LIST,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {analyst}"},
+            body={}))
+        assert resp.status == 200
+        sources = resp.body["data"]["sources"]
+        ids = {s["source_instance_id"] for s in sources}
+        assert sid in ids
+        ours = next(s for s in sources
+                    if s["source_instance_id"] == sid)
+        assert ours["source_type"] == "nginx"
+        assert ours["state"] == "enabled"
+        # DISABLE
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_SOURCE_DISABLE,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin}"},
+            body={"source_instance_id": sid}))
+        assert resp.status == 200
+        assert resp.body["data"]["source"]["state"] == "disabled"
+        # RE-ENABLE
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_SOURCE_ENABLE,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin}"},
+            body={"source_instance_id": sid}))
+        assert resp.status == 200
+        assert resp.body["data"]["source"]["state"] == "enabled"
+        # RETIRE
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_SOURCE_RETIRE,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin}"},
+            body={"source_instance_id": sid}))
+        assert resp.status == 200
+        assert resp.body["data"]["source"]["state"] == "retired"
+        # Source still appears in the list.
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_SOURCE_LIST,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {analyst}"},
+            body={}))
+        assert resp.status == 200
+
+
+class TestAdminSourceTypeClosedSetRbac:
+    """Closed set enforced server-side. Unknown types are
+    400 (bad request), not 403 (forbidden)."""
+
+    def test_unknown_source_type_is_400(self) -> None:
+        proxy = _proxy_with_source_service()
+        admin = _token(proxy, "user-admin-001")
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_SOURCE_REGISTER,
+            headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin}"},
+            body={"source_type": "totally-fake",
+                  "display_name": "Fake"}))
+        assert resp.status == 400
+        assert "unknown" in resp.body["error"]["message"].lower()
+
+    def test_correct_contract_accepted(self) -> None:
+        # F-6: the closed ``SourceType`` enum still declares six kinds,
+        # but only the IMPLEMENTED connector types (nginx, simulator)
+        # are accepted at registration time. Declared-but-unimplemented
+        # kinds (waf, iam, rate_limit, network) have no connector
+        # backend and must be rejected 400 so the product never
+        # admits a phantom source it cannot ingest or evaluate.
+        proxy = _proxy_with_source_service()
+        admin = _token(proxy, "user-admin-001")
+        for t in ["nginx", "simulator"]:
+            resp = proxy.handle(ProxyRequest(
+                operation=OP_SOURCE_REGISTER,
+                headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin}"},
+                body={"source_type": t,
+                      "display_name": f"src-{t}"}))
+            assert resp.status == 200, (
+                f"implemented type rejected {t!r}: {resp.body}")
+        for t in ["waf", "iam", "rate_limit", "network"]:
+            resp = proxy.handle(ProxyRequest(
+                operation=OP_SOURCE_REGISTER,
+                headers={PROXY_HEADER_AUTHORIZATION: f"Bearer {admin}"},
+                body={"source_type": t,
+                      "display_name": f"src-{t}"}))
+            assert resp.status == 400, (
+                f"unimplemented type {t!r} must be rejected: {resp.body}")
+
+
+class TestRoleDefaultsRbac:
+    """Sanity check on the role-default permission sets."""
+
+    def test_analyst_default_does_not_include_source_write(self) -> None:
+        from app.auth.permissions import (
+            ALL_PERMISSIONS, Permission, ROLE_PERMISSIONS)
+        assert "source:write" in ALL_PERMISSIONS
+        analyst = ROLE_PERMISSIONS[ANALYST_ROLE]
+        assert Permission.SOURCE_WRITE not in analyst
+
+    def test_admin_default_includes_source_write(self) -> None:
+        from app.auth.permissions import (
+            Permission, ROLE_PERMISSIONS)
+        admin = ROLE_PERMISSIONS[ADMIN_ROLE]
+        assert Permission.SOURCE_WRITE in admin
+
+    def test_collector_default_has_no_source_read(self) -> None:
+        from app.auth.permissions import (
+            Permission, ROLE_PERMISSIONS)
+        collector = ROLE_PERMISSIONS["collector"]
+        # Collector submits events but cannot see the source
+        # inventory. AUTH_RBAC.md RBAC-004.
+        assert Permission.SOURCE_READ not in collector
+
+
+class TestSourceUnauthenticatedRbac:
+    """Unauthenticated callers must get 401 on every
+    protected op (no token at all)."""
+
+    def test_analyst_gets_401_without_token(self) -> None:
+        proxy = _proxy_with_source_service()
+        resp = proxy.handle(ProxyRequest(
+            operation=OP_SOURCE_REGISTER, headers={},
+            body={"source_type": "nginx", "display_name": "x"}))
+        assert resp.status == 401

@@ -256,13 +256,32 @@ class SourceRegistry:
             )
 
 
-SUPPORTED_CONNECTOR_TYPES: frozenset[SourceType] = frozenset(
-    s for s in SourceType
-)
+# F-6: only connector types that have a real connector
+# implementation + rule library are advertised as "supported".
+# The SourceType enum still declares the full closed-set of possible
+# kinds (so a future connector can reuse the model), but
+# ``supported_connector_types()`` -- which drives the wire
+# ``source.list_types`` response and thereby the UI combobox -- must
+# reflect which kinds are actually implemented today. Only ``nginx``
+# (full rule library) and ``simulator`` have runnable connectors;
+# ``waf``, ``iam``, ``rate_limit`` and ``network`` have NO
+# connector/rules implementation, so advertising them as "supported"
+# would (and did) create phantom sources the system cannot ingest or
+# evaluate.
+SUPPORTED_CONNECTOR_TYPES: frozenset[SourceType] = frozenset({
+    SourceType.NGINX,
+    SourceType.SIMULATOR,
+})
 
 
 def supported_connector_types() -> List[SourceType]:
-    """Return the closed-set list of supported connector types."""
+    """Return the closed-set list of supported connector types.
+
+    Only types with a real connector implementation and a rule
+    library are included (F-6). Declared-but-unimplemented kinds
+    are intentionally excluded so the UI never advertises phantom
+    capabilities and registration never panics on an unknown type.
+    """
     return sorted(SUPPORTED_CONNECTOR_TYPES, key=lambda t: t.value)
 
 

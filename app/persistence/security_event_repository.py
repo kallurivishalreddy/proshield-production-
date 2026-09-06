@@ -306,6 +306,40 @@ class SecurityEventRepository:
             d for d in (_document_to_event(c) for c in cursor) if d
         ]
 
+    def find_recent(
+        self,
+        *,
+        limit: int = 200,
+        source_instance_id: Optional[str] = None,
+    ) -> List[SecurityEvent]:
+        """Return the most recent events, newest first (V2-06).
+
+        The documented ``ev_time_desc`` index serves this read
+        pattern. ``limit`` is hard-bounded to 200 so the unfiltered
+        read can never stream the whole event store. This is the
+        analyst visibility surface for events that matched **no**
+        rule: a valid, trusted, persisted event must be reachable by
+        the analyst even when it produced zero detections (V2-06).
+        """
+        bounded = max(1, min(int(limit), 200))
+        query: Dict[str, Any] = {}
+        if source_instance_id:
+            query["provenance.source_instance_id"] = source_instance_id
+        try:
+            cursor = (
+                self._collection.find(query)
+                .sort("event_time", -1)
+                .limit(bounded)
+            )
+        except PyMongoError as exc:
+            raise PersistenceError(
+                safe_message="could not list recent events",
+                internal_detail=f"find failed: {type(exc).__name__}",
+            ) from exc
+        return [
+            d for d in (_document_to_event(c) for c in cursor) if d
+        ]
+
     def count(self) -> int:
         try:
             return int(self._collection.count_documents({}))

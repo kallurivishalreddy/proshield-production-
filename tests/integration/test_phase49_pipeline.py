@@ -282,8 +282,8 @@ class TestSourceIdentityTokenRoundTrip:
         svc, registry, issuer = source_service
         view = svc.register(
             identity=_admin(),
-            source_type=SourceType.WAF,
-            display_name="Prod WAF",
+            source_type=SourceType.NGINX,
+            display_name="Prod Web",
         )
         sid = view.source_instance_id
         svc.configure(
@@ -317,8 +317,8 @@ class TestSourceIdentityTokenRoundTrip:
             replay_store=_InMemoryReplayStore(),
         ).verify(packed)
         assert verified.source_instance_id == sid
-        assert verified.source == "waf"
-        assert verified.source_type == "waf"
+        assert verified.source == "nginx"
+        assert verified.source_type == "nginx"
 
 
 class TestIngressWithPersistedSource:
@@ -630,7 +630,7 @@ class TestSourceEndToEndThroughProxy:
             headers={
                 PROXY_HEADER_AUTHORIZATION: f"Bearer {admin_token}",
             },
-            body={"source_type": "waf", "display_name": "Prod WAF"},
+            body={"source_type": "nginx", "display_name": "Prod Web"},
         ))
         assert resp.status == 200
         sid = resp.body["data"]["source"]["source_instance_id"]

@@ -47,6 +47,7 @@ from typing import (
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
     StringConstraints,
 )
 
@@ -265,6 +266,21 @@ class Incident(BaseModel):
         str,
         StringConstraints(min_length=0, max_length=MAX_CASE_REASONING_LEN),
     ] = ""
+    # V2-09 fix: the composed case-level severity + confidence, using
+    # the *documented bands* of :class:`app.severity.models`
+    # (``SeverityBand`` / ``ConfidenceBand``). Composed by the
+    # documented :class:`app.severity.engine.SeverityEngine` over the
+    # case's bundle evidence at case creation, and re-composed
+    # (monotonically — never lowered) whenever the case evidence
+    # grows. Empty string = not composed (the UI must render "—",
+    # never a fabricated number: the severity model explicitly forbids
+    # inventing values).
+    severity: Annotated[
+        str, StringConstraints(min_length=0, max_length=32)
+    ] = ""
+    confidence: Annotated[
+        str, StringConstraints(min_length=0, max_length=32)
+    ] = ""
     created_by: Annotated[
         str, StringConstraints(min_length=1, max_length=128)
     ]
@@ -278,6 +294,8 @@ class Incident(BaseModel):
             "summary": self.summary,
             "state": self.state.value,
             "evidence": self.evidence.to_dict(),
+            "severity": self.severity or None,
+            "confidence": self.confidence or None,
             "rule_references": [
                 {"rule_id": rid, "rule_version": ver}
                 for rid, ver in self.rule_references

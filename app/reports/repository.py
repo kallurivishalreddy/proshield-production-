@@ -59,6 +59,54 @@ def report_collection_name(config: ProShieldConfig) -> str:
     return getattr(config, "mongo_collection_reports", "reports")
 
 
+# ----------------------------------------------------------------- validator
+# V2-P0 fix: the documented $jsonSchema validator for the ``reports``
+# collection. It mirrors the required fields of the
+# :class:`app.reports.models.Report` model so a deployment that boots
+# through :func:`app.persistence.bootstrap.ensure_all_collections`
+# gets schema defence-in-depth at the database boundary, not just the
+# Pydantic layer.
+REPORTS_VALIDATOR: Dict[str, Any] = {
+    "$jsonSchema": {
+        "bsonType": "object",
+        "additionalProperties": False,
+        "required": [
+            "report_id",
+            "incident_id",
+            "mode",
+            "version",
+            "title",
+            "sections",
+            "generated_by",
+            "generated_at",
+            "evidence_references",
+            "rule_references",
+            "is_centralized",
+            "centralized_correlation_ids",
+        ],
+        "properties": {
+            "_id": {"bsonType": "objectId"},
+            "report_id": {"bsonType": "string"},
+            "incident_id": {"bsonType": "string"},
+            "mode": {"bsonType": "string"},
+            "version": {"bsonType": ["int", "long", "double"]},
+            "title": {"bsonType": "string"},
+            "sections": {"bsonType": "array"},
+            "generated_by": {"bsonType": "string"},
+            # ``Report.to_dict()`` serialises ``generated_at`` as an
+            # ISO-8601 string (JSON-friendly wire artifact); the
+            # validator therefore accepts the string form the
+            # repository actually persists.
+            "generated_at": {"bsonType": "string"},
+            "evidence_references": {"bsonType": "array"},
+            "rule_references": {"bsonType": "array"},
+            "is_centralized": {"bsonType": "bool"},
+            "centralized_correlation_ids": {"bsonType": "array"},
+        },
+    }
+}
+
+
 # ----------------------------------------------------------------- repository
 class ReportRepository:
     """Repository for the ``reports`` collection."""
@@ -89,7 +137,10 @@ class ReportRepository:
             ) from exc
         try:
             if not docs:
-                self._db.create_collection(self._collection.name)
+                self._db.create_collection(
+                    self._collection.name,
+                    validator=REPORTS_VALIDATOR,
+                )
         except PyMongoError as exc:
             raise PersistenceError(
                 safe_message="could not apply reports schema",

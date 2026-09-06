@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sign in · ProShield</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2306b6d4'/%3E%3Ctext x='16' y='22' font-family='Arial' font-size='18' font-weight='bold' fill='%2304121a' text-anchor='middle'%3EP%3C/text%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/static/css/app.css" />
+<style>
+    body { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .login-card {
+        background: var(--bg-1);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 32px 36px;
+        max-width: 420px;
+        width: 100%;
+        box-shadow: var(--shadow-strong);
+    }
+    .login-card .brand {
+        display: flex; align-items: center; gap: 10px;
+        font-weight: 700; font-size: 1.3rem; margin-bottom: 4px;
+    }
+    .login-card .brand .logo {
+        width: 32px; height: 32px;
+        border-radius: 8px;
+        background: linear-gradient(135deg, var(--brand), var(--brand-2));
+        display: inline-flex; align-items: center; justify-content: center;
+        color: #061018; font-weight: 800;
+    }
+    .login-card p { color: var(--text-3); font-size: 0.9rem; }
+    .login-card .row-field { margin-bottom: 12px; }
+    .login-card .btn { width: 100%; padding: 12px; font-size: 1rem; }
+    .login-card .hint {
+        margin-top: 16px;
+        background: var(--bg-2);
+        padding: 12px;
+        border-radius: var(--radius-sm);
+        font-size: 0.8rem;
+        color: var(--text-3);
+    }
+    .login-card .hint b { color: var(--text-1); }
+</style>
+</head>
+<body class="login-page">
+<div class="login-card">
+    <div class="brand">
+        <span class="logo">P</span>
+        ProShield
+    </div>
+    <p>Security Intelligence Engine — Analyst Console</p>
+    <form id="login-form" autocomplete="off">
+        <div class="row-field">
+            <label for="subject">Subject ID</label>
+            <input id="subject" name="subject" autocomplete="username"
+                   placeholder="analyst / admin / collector" required />
+        </div>
+        <div class="row-field">
+            <label for="credential">Credential</label>
+            <input id="credential" name="credential" type="password"
+                   autocomplete="current-password" required />
+        </div>
+        <button type="submit" class="btn btn-primary" id="login-btn">Sign in</button>
+        <div id="login-error" class="error-banner" style="display:none;margin-top:12px;"></div>
+    </form>
+    <div class="hint">
+        <b>Default dev credentials (memory backend):</b><br/>
+        admin / admin-dev-credential<br/>
+        analyst / analyst-dev-credential<br/>
+        collector / collector-dev-credential
+    </div>
+</div>
+<script src="/static/js/services/api.js"></script>
+<script>
+document.getElementById("login-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const subject = document.getElementById("subject").value.trim();
+    const credential = document.getElementById("credential").value;
+    const btn = document.getElementById("login-btn");
+    const errEl = document.getElementById("login-error");
+    errEl.style.display = "none";
+    btn.disabled = true;
+    btn.textContent = "Signing in…";
+    try {
+        const r = await PSAPI.authIssue(subject, credential);
+        if (r.ok && r.data && r.data.token) {
+            const next = new URL(window.location.href).searchParams.get("next") || "/static/index.html";
+            window.location.href = next;
+            return;
+        }
+        errEl.textContent = (r.error && r.error.message) || "Sign-in failed.";
+        errEl.style.display = "block";
+    } finally {
+        btn.disabled = false;
+        btn.textContent = "Sign in";
+    }
+});
+</script>
+</body>
+</html>

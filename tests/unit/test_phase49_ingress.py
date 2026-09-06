@@ -602,3 +602,58 @@ class TestIngressRateLimit:
         assert ev.details.get("_untrusted_endpoint") == (
             "https://evil.example.com/leak"
         )
+class TestIngressCaseInsensitiveHeaders:
+    """STRIX D-2 regression: ``_extract_token`` must accept
+    lowercased header keys exactly as a real HTTP server delivers
+    them (Starlette / FastAPI / uvicorn / reverse proxies).
+    """
+
+    def test_lowercase_authorization_header_accepted(self) -> None:
+        reg = SourceRegistry()
+        inst = _enabled_nginx_instance()
+        reg.register(inst)
+        proxy = _proxy(registry=reg)
+        token = _issue(_issuer(), inst)
+        resp = proxy.handle(IngressRequest(
+            operation=OP_INGEST,
+            headers={
+                INGRESS_HEADER_AUTHORIZATION.lower():
+                    f"Bearer {token}",
+            },
+            body={"events": []},
+            body_bytes=0,
+        ))
+        assert resp.status == 200, resp.body
+        assert "accepted_event_ids" in resp.body["data"]
+
+    def test_lowercase_token_header_accepted(self) -> None:
+        reg = SourceRegistry()
+        inst = _enabled_nginx_instance()
+        reg.register(inst)
+        proxy = _proxy(registry=reg)
+        token = _issue(_issuer(), inst)
+        resp = proxy.handle(IngressRequest(
+            operation=OP_INGEST,
+            headers={
+                INGRESS_HEADER_TOKEN.lower(): token,
+            },
+            body={"events": []},
+            body_bytes=0,
+        ))
+        assert resp.status == 200, resp.body
+
+    def test_mixed_case_authorization_header_accepted(self) -> None:
+        reg = SourceRegistry()
+        inst = _enabled_nginx_instance()
+        reg.register(inst)
+        proxy = _proxy(registry=reg)
+        token = _issue(_issuer(), inst)
+        resp = proxy.handle(IngressRequest(
+            operation=OP_INGEST,
+            headers={
+                "aUtHoRiZaTiOn": f"Bearer {token}",
+            },
+            body={"events": []},
+            body_bytes=0,
+        ))
+        assert resp.status == 200, resp.body

@@ -183,6 +183,7 @@ class IncidentService:
         correlations: Sequence[Correlation] = (),
         timeline=None,
         severity=None,
+        incident_id: Optional[str] = None,
     ) -> Incident:
         if not isinstance(identity, Identity):
             raise InvalidIncidentInputError(
@@ -236,13 +237,14 @@ class IncidentService:
             rule_references=rule_refs,
         )
         now = datetime.now(timezone.utc)
-        incident_id = _make_case_id(
-            event_ids=event_ids,
-            detection_ids=detection_ids,
-            correlation_ids=correlation_ids,
-            created_at=now,
-            seed=identity.subject_id,
-        )
+        if not incident_id:
+            incident_id = _make_case_id(
+                event_ids=event_ids,
+                detection_ids=detection_ids,
+                correlation_ids=correlation_ids,
+                created_at=now,
+                seed=identity.subject_id,
+            )
         initial_transition = LifecycleTransition(
             from_state=None,
             to_state=CASE_STATE_OPEN,
@@ -251,6 +253,11 @@ class IncidentService:
             reason="case created",
             transitioned_at=now,
         )
+        # V2-09: compose the documented severity/confidence bands from
+        # the case's evidence at creation (SeverityEngine bundle pair).
+        composed_severity, composed_confidence = _compose_case_severity(
+            detections_list, correlations_list, {}
+        )
         case = Incident(
             incident_id=incident_id,
             title=str(title or "")[:MAX_CASE_TITLE_LEN],
@@ -258,7 +265,8 @@ class IncidentService:
             state=IncidentLifecycleState.OPEN,
             evidence=evidence,
             rule_references=rule_refs,
-            lifecycle_history=(initial_transition,),
+            severity=composed_severity or "",
+            confidence=composed_confidence or "",
             report_references=(),
             centralized_correlation_ids=(),
             centralized_reasoning="",
@@ -269,6 +277,92 @@ class IncidentService:
             updated_at=now,
         )
         return self._repository.create(case)
+
+    def create_case_for_correlation(
+        self,
+        *,
+        identity: Identity,
+        correlation: Correlation,
+        events: Sequence[SecurityEvent],
+        detections: Sequence[Detection],
+        title: Optional[str] = None,
+        summary: Optional[str] = None,
+    ) -> Incident:
+        """Open (or reuse) a case for a newly produced correlation.
+
+        This is the **automatic correlation->case** trigger the
+        STRIX F-2 finding required. It is idempotent on the
+        correlation's cluster key: the ``incident_id`` is derived
+        deterministically from the ``correlation_id`` (via
+        :func:`_case_id_for_correlation`), and
+        :meth:`IncidentRepository.create` no-ops on a duplicate, so
+        re-delivered events / re-run correlations can never open a
+        duplicate case.
+        """
+        if not isinstance(identity, Identity):
+            raise InvalidIncidentInputError(
+                safe_message="identity required",
+                internal_detail=f"got {type(identity).__name__}",
+                field="identity",
+            )
+        if not isinstance(correlation, Correlation):
+            raise InvalidIncidentInputError(
+                safe_message="invalid correlation",
+                internal_detail=(
+                    f"got {type(correlation).__name__}, expected Correlation"
+                ),
+                field="correlations",
+            )
+        case_id = _case_id_for_correlation(correlation)
+        existing = self._repository.get_by_id(case_id)
+        if existing is not None:
+            # V2-02 fix: the case is idempotent on the cluster key, but
+            # its *evidence* must accumulate as the cluster grows. The
+            # previous implementation returned the existing case
+            # unchanged, so a growing brute-force cluster left the case
+            # frozen at its first triggering event (the frozen-evidence
+            # finding). Merge the new evidence idempotently: same
+            # incident_id, union of evidence refs, recomposed severity,
+            # no duplicate rows, no duplicate case.
+            merged = _merge_case_evidence(
+                existing,
+                events=list(events or ()),
+                detections=list(detections or ()),
+                correlations=[correlation],
+                # V2-02 completeness: the correlation row is the
+                # cluster's authoritative evidence catalogue (it may
+                # hold detection/event ids from events processed before
+                # the case existed). Absorb them so the case reflects
+                # the full cluster, not just the triggering event.
+                extra_event_ids=tuple(getattr(correlation, "event_ids", ())),
+                extra_detection_ids=tuple(
+                    getattr(correlation, "detection_ids", ())
+                ),
+            )
+            if merged is not None:
+                now = datetime.now(timezone.utc)
+                merged = merged.model_copy(
+                    update={"updated_at": now},
+                )
+                return self._repository.upsert(merged)
+            return existing
+        resolved_title = (
+            str(title).strip()
+            if title else _correlation_case_title(correlation)
+        )
+        resolved_summary = (
+            str(summary).strip()
+            if summary else _correlation_case_summary(correlation)
+        )
+        return self.create_case(
+            identity=identity,
+            title=resolved_title,
+            summary=resolved_summary,
+            events=events,
+            detections=detections,
+            correlations=[correlation],
+            incident_id=case_id,
+        )
 
     def request_centralized_analysis(
         self,
@@ -488,6 +582,144 @@ class IncidentService:
 
 
 
+def _compose_case_severity(detections, correlations, events_by_id):
+    """V2-09: compose the case-level severity + confidence bands.
+
+    Delegates to the documented :class:`app.severity.engine.SeverityEngine`
+    over the case's evidence and returns the bundle's documented bands
+    ``(severity, confidence)`` — the exact ``SeverityBand`` /
+    ``ConfidenceBand`` strings the Phase 4.6 engine emits. Returns
+    ``(None, None)`` when the engine produces no bundle assessment so
+    the caller leaves the case fields unset (truthful absence — the
+    severity model explicitly forbids fabricated values). Fail-open: a
+    composition problem never blocks case creation.
+    """
+    try:
+        from ..severity.engine import SeverityEngine
+        from ..severity.models import ConfidenceBand, SeverityBand
+
+        result = SeverityEngine().run(
+            detections=tuple(detections),
+            correlations=tuple(correlations),
+            events=dict(events_by_id or {}),
+        )
+    except Exception as exc:  # noqa: BLE001 - composition is best-effort
+        _log.warning(
+            "incident.severity_composition_failed error=%s",
+            type(exc).__name__,
+        )
+        return None, None
+    severity = None
+    confidence = None
+    # The bundle pair is the LAST assessment pair the engine produced
+    # (subject_id == 'bundle:overall').
+    sev_list = list(getattr(result, "severity_assessments", ()) or ())
+    conf_list = list(getattr(result, "confidence_assessments", ()) or ())
+    for a in reversed(sev_list):
+        if str(getattr(a, "subject_id", "")) == "bundle:overall":
+            band = getattr(a, "band", None)
+            if isinstance(band, SeverityBand):
+                severity = band.value
+            break
+    for a in reversed(conf_list):
+        if str(getattr(a, "subject_id", "")) == "bundle:overall":
+            band = getattr(a, "band", None)
+            if isinstance(band, ConfidenceBand):
+                confidence = band.value
+            break
+    return severity, confidence
+
+
+def _merge_case_evidence(
+    existing,
+    *,
+    events,
+    detections,
+    correlations,
+    extra_event_ids: Sequence[str] = (),
+    extra_detection_ids: Sequence[str] = (),
+):
+    """V2-02: idempotently merge new evidence into an existing case.
+
+    Returns the merged case (unsaved) or ``None`` when the new
+    evidence adds nothing new (a pure re-delivery keeps the stored
+    document untouched, preserving ``updated_at`` stability). Severity
+    / confidence are re-composed monotonically: a growing cluster may
+    escalate a band, never silently downgrade it.
+
+    ``extra_event_ids`` / ``extra_detection_ids``: id-only evidence
+    references (e.g. the correlation row's own catalogue) merged
+    alongside the full model objects.
+    """
+    old_ev = existing.evidence
+    ev_event_ids = _dedup_preserving_order(
+        list(old_ev.event_ids)
+        + [e.event_id for e in events]
+        + list(extra_event_ids or ())
+    )
+    ev_detection_ids = _dedup_preserving_order(
+        list(old_ev.detection_ids)
+        + [d.detection_id for d in detections]
+        + list(extra_detection_ids or ())
+    )
+    ev_correlation_ids = _dedup_preserving_order(
+        list(old_ev.correlation_ids)
+        + [c.correlation_id for c in correlations]
+    )
+    grew = (
+        len(ev_event_ids) != len(old_ev.event_ids)
+        or len(ev_detection_ids) != len(old_ev.detection_ids)
+        or len(ev_correlation_ids) != len(old_ev.correlation_ids)
+    )
+    if not grew:
+        return None
+    new_rule_refs = _dedup_rule_refs(list(detections))
+    rule_refs = _dedup_preserving_order(
+        [tuple(r) for r in old_ev.rule_references]
+        + [tuple(r) for r in new_rule_refs]
+    )
+    new_evidence = IncidentEvidence(
+        event_ids=tuple(ev_event_ids),
+        detection_ids=tuple(ev_detection_ids),
+        correlation_ids=tuple(ev_correlation_ids),
+        rule_references=tuple(rule_refs),
+    )
+    updates: dict = {"evidence": new_evidence}
+    severity, confidence = _compose_case_severity(
+        list(detections), list(correlations), {}
+    )
+    try:
+        from ..severity.models import (
+            _CONFIDENCE_RANK,
+            _SEVERITY_RANK,
+            ConfidenceBand,
+            SeverityBand,
+        )
+
+        old_sev = getattr(existing, "severity", "") or None
+        if severity:
+            new_band = SeverityBand(severity)
+            if not old_sev or (
+                _SEVERITY_RANK[new_band]
+                >= _SEVERITY_RANK.get(SeverityBand(old_sev), 0)
+            ):
+                updates["severity"] = severity
+        old_conf = getattr(existing, "confidence", "") or None
+        if confidence:
+            new_band = ConfidenceBand(confidence)
+            if not old_conf or (
+                _CONFIDENCE_RANK[new_band]
+                >= _CONFIDENCE_RANK.get(ConfidenceBand(old_conf), 0)
+            ):
+                updates["confidence"] = confidence
+    except Exception:  # noqa: BLE001 - composition stays best-effort
+        if severity and not getattr(existing, "severity", ""):
+            updates["severity"] = severity
+        if confidence and not getattr(existing, "confidence", ""):
+            updates["confidence"] = confidence
+    return existing.model_copy(update=updates)
+
+
 def _dedup_rule_refs(detections):
     seen = set()
     out = []
@@ -543,6 +775,63 @@ def _make_case_id(
         "case-"
         f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-"
         f"{hex_str[16:20]}-{hex_str[20:32]}"
+    )
+
+
+def _case_id_for_correlation(correlation: Correlation) -> str:
+    """Deterministic case id **per correlation cluster**.
+
+    The id is a pure function of the stable cluster signature
+    (``pattern_id`` + correlation key parts) — NOT the exact
+    ``correlation_id`` (which changes as a cluster grows) and NOT the
+    wall clock. This is the F-2 idempotency guarantee: a growing
+    brute-force cluster always resolves to the same case id, and a
+    re-run / retry / restarted worker never opens a duplicate case.
+    The returned id is a UUID-v7-format string (>= 36 chars) that
+    satisfies the ``Incident.incident_id`` constraints.
+    """
+    key_parts = (
+        list(correlation.key.parts)
+        if getattr(getattr(correlation, "key", None), "parts", None)
+        else []
+    )
+    sig = ":".join([correlation.pattern_id, "|".join(key_parts)])
+    digest = hashlib.sha256(sig.encode("utf-8")).digest()
+    # Derive every UUID field from the digest so the id is stable across
+    # calls, retries, and process restarts (no DateTime.now() here).
+    ts_ms = int.from_bytes(digest[0:6], "big") & ((1 << 48) - 1)
+    rand_a = int.from_bytes(digest[6:8], "big") & 0x0FFF
+    rand_b_hi = (int.from_bytes(digest[8:10], "big") & 0x3FFF) | 0x8000
+    rand_b_lo = int.from_bytes(digest[10:16], "big")
+    uuid_int = (
+        (ts_ms << 80) | (0x7 << 76) | (rand_a << 64)
+        | (rand_b_hi << 48) | rand_b_lo
+    )
+    hex_str = f"{uuid_int:032x}"
+    return (
+        "case-"
+        f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-"
+        f"{hex_str[16:20]}-{hex_str[20:32]}"
+    )
+
+
+def _correlation_case_title(correlation: Correlation) -> str:
+    """A human-readable title for an auto-opened case."""
+    key = correlation.key
+    return (
+        f"Correlated security cluster "
+        f"({key.parts[0] if key.parts else '?'})"
+    )
+
+
+def _correlation_case_summary(correlation: Correlation) -> str:
+    """A brief, evidence-faithful summary for an auto-opened case."""
+    reasoning = str(correlation.reasoning or "")
+    if len(reasoning) > 1024:
+        reasoning = reasoning[:1021] + "..."
+    return (
+        f"{correlation.pattern_id} v{correlation.pattern_version}: "
+        f"{reasoning}"
     )
 
 

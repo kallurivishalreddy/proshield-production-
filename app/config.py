@@ -141,6 +141,12 @@ class ProShieldConfig:
     )
     ingress_max_response_bytes: int = 1_048_576  # 1 MiB
 
+    # MongoDB collection holding claimed source-identity token
+    # ids (single-use / R-1).  ``MongoReplayStore`` uses this
+    # name; it is consumed by ``app.sources.replay_store`` in the
+    # deployment listener (scripts/ingress_server.py).
+    ingress_replay_collection: str = "source_token_replay"
+
     # Comma-separated "name:module.path:ClassName" entries.
     connector_specs: List[str] = field(default_factory=list)
 
@@ -242,6 +248,10 @@ class ProShieldConfig:
             ingress_replay_store_required=_env(
                 "PROSHIELD_INGRESS_REPLAY_STORE_REQUIRED", "1"
             ) not in ("0", "false", "False", ""),
+            ingress_replay_collection=_env(
+                "PROSHIELD_INGRESS_REPLAY_COLLECTION",
+                "source_token_replay",
+            ),
             secret_store_configured=_env(
                 "PROSHIELD_SECRET_STORE_CONFIGURED", "0"
             ) in ("1", "true", "True"),
@@ -286,6 +296,7 @@ class ProShieldConfig:
                 self.ingress_max_events_per_request,
             "ingress_replay_store_required":
                 self.ingress_replay_store_required,
+            "ingress_replay_collection": self.ingress_replay_collection,
             "secret_store_configured": self.secret_store_configured,
             "default_subject_credentials_count":
                 len(self.default_subject_credentials),

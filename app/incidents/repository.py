@@ -153,6 +153,11 @@ INCIDENTS_VALIDATOR: Dict[str, Any] = {
                 "bsonType": "string",
                 "maxLength": 2048,
             },
+            # V2-09: composed case severity + confidence, stored as the
+            # documented band strings (low/medium/high/critical and
+            # low/medium/high/very_high). Optional; "" = not composed.
+            "severity": {"bsonType": "string", "maxLength": 32},
+            "confidence": {"bsonType": "string", "maxLength": 32},
             "created_by": {"bsonType": "string", "minLength": 1, "maxLength": 128},
             "created_at": {"bsonType": "date"},
             "updated_at": {"bsonType": "date"},
