@@ -34,11 +34,24 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Install runtime and test dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r deploy/requirements-runtime.txt
           python -m pip install pytest cryptography httpx2
+
+      - name: Install frontend dependencies
+        working-directory: frontend/src_upgraded_gemini
+        run: npm ci
+
+      - name: Build frontend artifact
+        working-directory: frontend/src_upgraded_gemini
+        run: npm run build
 
       - name: Run the complete pytest suite
         run: python -m pytest
