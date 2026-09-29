@@ -136,9 +136,58 @@ class SourcePersistenceError(SourceManagementError, PersistenceError):
     http_status = 503
 
 
+# ---------------------------------------------------------------- Phase 5.2
+class SourceCapabilityBindingError(
+    SourceManagementError, ValidationError
+):
+    """The requested source -> capability binding is not valid.
+
+    Raised when a caller supplies an unknown capability id, a mapping
+    profile that the owning capability does not declare, a capability
+    that is retired/archived (or a ``planned`` capability that has no
+    live implementation), or a binding payload that is not shaped like
+    a capability reference at all.
+    """
+
+    code = "source_capability_binding_error"
+    http_status = 400
+
+
+class SourceCapabilityUnverifiedError(SourceManagementError):
+    """The source instance has no verified capability binding.
+
+    Phase 5.2 quarantines a source whose capability could not be
+    resolved (the legacy migration refuses to invent an owner). Such a
+    source may not be validated, enabled or accept telemetry:
+    ``capability_id`` is absent, so there is no server-side capability
+    to derive and stamp on the canonical event. The response is an
+    explicit conflict, never a silent default.
+    """
+
+    code = "source_capability_unverified"
+    http_status = 409
+
+
+class DuplicateSourceCapabilityBindingError(
+    SourceManagementError, ConflictEventError
+):
+    """The source is already bound to that exact capability.
+
+    Re-binding a source to the capability it already holds is
+    idempotent in intent but must not silently produce a second audit
+    record claiming a change that did not happen.
+    """
+
+    code = "duplicate_source_capability_binding"
+    http_status = 409
+
+
 __all__ = [
+    "DuplicateSourceCapabilityBindingError",
     "DuplicateSourceInstanceError",
     "SourceAuthorizationError",
+    "SourceCapabilityBindingError",
+    "SourceCapabilityUnverifiedError",
     "SourceConfigurationError",
     "SourceIdentityTokenError",
     "SourceInstanceNotFoundError",

@@ -88,6 +88,8 @@ def _make_metadata() -> RuleMetadata:
         category=RuleCategory.SOURCE_SPECIFIC,
         sources=("nginx",),
         event_types=("rate_limit_exceeded",),
+        # Phase 5.2: capability ownership (see NGINX-AUTH-FAILURE-001).
+        capability_id="cap-nginx",
         state=RuleState.APPROVED,
         enabled=True,
         description=(

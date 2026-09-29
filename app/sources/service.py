@@ -44,13 +44,18 @@ from ..auth.permissions import (
     has_permission,
 )
 from .errors import (
+    DuplicateSourceCapabilityBindingError,
     SourceAuthorizationError,
+    SourceCapabilityBindingError,
+    SourceCapabilityUnverifiedError,
     SourceConfigurationError,
     SourceInstanceNotFoundError,
     SourceInstanceStateError,
 )
+from .audit import snapshot_source
 from .models import (
     MAX_SOURCE_INSTANCE_NAME_LEN,
+    CapabilityBindingStatus,
     SourceConnectionType,
     SourceInstance,
     SourceInstanceConfiguration,
@@ -115,6 +120,8 @@ class SourceManagementService:
         registry: SourceRegistry,
         *,
         token_issuer: Optional[SourceIdentityTokenIssuer] = None,
+        capability_lookup: Optional[Any] = None,
+        audit_collection: Optional[Any] = None,
     ) -> None:
         if repository is None:
             raise ValueError("repository is required")
@@ -123,6 +130,256 @@ class SourceManagementService:
         self._repository = repository
         self._registry = registry
         self._token_issuer = token_issuer
+        # Phase 5.2: server-authoritative capability resolution.
+        #
+        # ``capability_lookup`` is the only way this service learns what a
+        # capability *is*. It is injected (rather than imported) so the
+        # source layer keeps its existing one-way dependency and so the
+        # tests can exercise the binding rules without a Mongo-backed
+        # capability registry.
+        self._capability_lookup = capability_lookup
+        # Append-only Phase 5.2 audit sink for security-sensitive source
+        # writes (binding, lifecycle, token issuance/rotation, migration).
+        # ``None`` degrades to log-only, never to a silent success.
+        self._audit_collection = audit_collection
+
+    # ------------------------------------------------------- late wiring
+    def set_capability_lookup(self, lookup: Optional[Any]) -> None:
+        """Late-bind the capability registry lookup.
+
+        The runtime composition builds the capability registry *after* the
+        source service (the registry itself takes the source service as a
+        relationship source), so this setter exists to avoid a circular
+        construction order. Passing ``None`` restores the shipped-seed
+        fallback authority.
+        """
+        self._capability_lookup = lookup
+
+    def set_audit_collection(self, collection: Optional[Any]) -> None:
+        """Late-bind the append-only source audit collection."""
+        self._audit_collection = collection
+
+    # ----------------------------------------------------------------- audit
+    def _audit(
+        self,
+        *,
+        action: str,
+        source: Any,
+        before: Optional[Dict[str, Any]] = None,
+        after: Optional[Dict[str, Any]] = None,
+        reason: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> None:
+        """Append one source audit record (never raises)."""
+        from .audit import (
+            append_audit_record,
+            build_audit_record,
+            snapshot_source,
+        )
+
+        if self._audit_collection is None:
+            return
+        source_instance_id = getattr(
+            source, "source_instance_id", None
+        ) or (source or {}).get("source_instance_id")
+        if not source_instance_id:
+            return
+        try:
+            record = build_audit_record(
+                action=action,
+                actor=actor or getattr(source, "updated_by", "") or "system",
+                source_instance_id=str(source_instance_id),
+                human_id=getattr(source, "human_id", None),
+                capability_id=getattr(source, "capability_id", None),
+                reason=reason,
+                before=before if before is not None else snapshot_source(
+                    source
+                ),
+                after=after if after is not None else snapshot_source(source),
+            )
+            append_audit_record(self._audit_collection, record)
+        except Exception as exc:  # noqa: BLE001 - audit must never break
+            _log.error(
+                "source_audit_build_failed source_instance_id=%s action=%s "
+                "error=%s",
+                source_instance_id,
+                action,
+                type(exc).__name__,
+            )
+
+    # ------------------------------------------------------------- binding
+    def _resolve_binding(
+        self,
+        *,
+        source_type: SourceType,
+        capability_id: Optional[str],
+        mapping_profile_id: Optional[str],
+        allow_non_active: bool = False,
+    ) -> Any:
+        """Resolve + validate the capability binding for a source type.
+
+        Returns a :class:`ResolvedBinding`, or ``None`` when neither a
+        capability nor a profile was requested **and** no capability can be
+        resolved deterministically. It never returns a fabricated binding:
+        every failure path raises.
+        """
+        from .capability_binding import (
+            builtin_capability_index,
+            resolve_capability_id_for_type,
+            validate_capability_binding,
+        )
+
+        requested = capability_id
+        if requested is None:
+            requested = resolve_capability_id_for_type(source_type)
+        if requested is None:
+            if mapping_profile_id is not None:
+                raise SourceConfigurationError(
+                    safe_message=(
+                        "mapping_profile_id requires a capability binding"
+                    ),
+                    internal_detail=(
+                        "no capability provided and none could be resolved "
+                        f"for source_type={source_type.value!r}"
+                    ),
+                )
+            return None
+        if not isinstance(requested, str) or not requested:
+            raise SourceConfigurationError(
+                safe_message="capability_id must be a non-empty string",
+                internal_detail=f"got {type(requested).__name__}",
+            )
+        # The live capability registry is the primary authority. When the
+        # source layer is composed without one (legacy Phase 4.9 harnesses),
+        # the shipped seed catalogue is used so binding is still *enforced*
+        # rather than silently skipped — the enforcement gate must not
+        # depend on optional wiring.
+        capability = None
+        if self._capability_lookup is not None:
+            capability = self._capability_lookup(requested)
+        else:
+            _log.warning(
+                "source_binding_registry_absent capability_id=%s "
+                "fallback=builtin_seed_catalogue",
+                requested,
+            )
+            capability = builtin_capability_index().get(requested)
+        return validate_capability_binding(
+            capability,
+            source_type=source_type.value,
+            mapping_profile_id=mapping_profile_id,
+            allow_non_active=allow_non_active,
+        )
+
+    # ------------------------------------------------------------- binding
+    def _require_bound(self, current: Any, action: str) -> None:
+        """Refuse a lifecycle action on a source with no verified capability.
+
+        Phase 5.2 invariant: a source resolves to a capability before it can
+        be validated, enabled or used to ingest. A quarantined
+        (``requires_verification``) or unbound row is refused with an
+        explicit 409 rather than being silently promoted.
+        """
+        status = current.capability_binding_status
+        status_val = getattr(status, "value", status)
+        if status_val == CapabilityBindingStatus.BOUND.value and (
+            current.capability_id
+        ):
+            return
+        raise SourceCapabilityUnverifiedError(
+            safe_message=(
+                f"source instance {action} requires a verified capability "
+                "binding"
+            ),
+            internal_detail=(
+                f"capability_binding_status={status_val!r} "
+                f"capability_id={current.capability_id!r}"
+            ),
+        )
+
+    def bind_capability(
+        self,
+        *,
+        identity: Identity,
+        source_instance_id: SourceInstanceId,
+        capability_id: str,
+        mapping_profile_id: Optional[str] = None,
+    ) -> SourceInstanceView:
+        """Authoritatively (re)bind a source instance to a capability.
+
+        Admin-only. This is the supported remediation path for a source the
+        legacy migration had to quarantine, and the supported way to move a
+        source to a different capability after a capability migration.
+
+        Refusals (all explicit, none silent):
+        * unknown / non-live capability -> 400;
+        * a mapping profile the capability does not declare -> 400;
+        * the source is RETIRED (immutable history) -> 409;
+        * the source already holds this exact binding -> 409, so no audit
+          record claims a change that did not happen.
+        """
+        _require_role(identity, ADMIN_ROLE)
+        current = self._registry.get_required(source_instance_id)
+        if current.state is SourceState.RETIRED:
+            raise SourceInstanceStateError(
+                safe_message="retired source instances are immutable",
+                internal_detail=(
+                    f"source_instance_id={source_instance_id!r} "
+                    f"state={current.state.value}"
+                ),
+            )
+        if not isinstance(capability_id, str) or not capability_id:
+            raise SourceCapabilityBindingError(
+                safe_message="capability_id must be a non-empty string",
+                internal_detail=f"got {type(capability_id).__name__}",
+            )
+        binding = self._resolve_binding(
+            source_type=current.source_type,
+            capability_id=capability_id,
+            mapping_profile_id=mapping_profile_id,
+        )
+        if binding is None:
+            raise SourceCapabilityBindingError(
+                safe_message="unknown capability",
+                internal_detail=f"capability_id={capability_id!r}",
+            )
+        already = (
+            current.capability_id == binding.capability_id
+            and current.capability_version == binding.capability_version
+            and current.mapping_profile_id == binding.mapping_profile_id
+        )
+        if already:
+            raise DuplicateSourceCapabilityBindingError(
+                safe_message=(
+                    "source instance is already bound to that capability"
+                ),
+                internal_detail=(
+                    f"capability_id={binding.capability_id!r} "
+                    f"capability_version={binding.capability_version}"
+                ),
+            )
+        before = snapshot_source(current)
+        now = _utcnow()
+        updated = current.model_copy(update={
+            **binding.as_update(),
+            "capability_binding_status": CapabilityBindingStatus.BOUND,
+            "capability_bound_at": now,
+            "updated_by": identity.subject_id,
+            "updated_at": now,
+        })
+        persisted = self._repository.upsert(updated)
+        self._registry.replace(persisted)
+        self._audit(
+            action="source_bind_capability",
+            source=persisted,
+            before=before,
+            reason=(
+                f"capability binding {binding.capability_id!r} "
+                f"v{binding.capability_version}"
+            ),
+            actor=identity.subject_id,
+        )
+        return persisted.to_view()
 
     # ----------------------------------------------------------------- reads
     def get(self, source_instance_id: SourceInstanceId) -> SourceInstanceView:
@@ -173,9 +430,19 @@ class SourceManagementService:
         description: str = "",
         tags: Tuple[str, ...] = (),
         asset_tags: Tuple[str, ...] = (),
+        capability_id: Optional[str] = None,
+        mapping_profile_id: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> SourceInstanceView:
-        """Register a new source instance (state=REGISTERED)."""
+        """Register a new source instance (state=REGISTERED).
+
+        Phase 5.2: a new source always carries a validated capability
+        binding. When the caller does not name one, the deterministic
+        ``SourceType -> capability`` map resolves it — so "new sources must
+        have a valid capability binding" holds without trusting the client
+        to choose. An unknown capability or an undeclared mapping profile is
+        a 400, never a silently unbound source.
+        """
         _require_role(identity, ADMIN_ROLE)
         if not isinstance(source_type, SourceType):
             raise SourceConfigurationError(
@@ -200,6 +467,23 @@ class SourceManagementService:
         if now is None:
             now = _utcnow()
         sid_id = _make_source_instance_id(display_name)
+        # Phase 5.2: resolve + validate the capability binding *before*
+        # touching persistence. A source is never persisted half-bound.
+        binding = self._resolve_binding(
+            source_type=source_type,
+            capability_id=capability_id,
+            mapping_profile_id=mapping_profile_id,
+        )
+        if binding is None:
+            raise SourceConfigurationError(
+                safe_message=(
+                    "no capability could be resolved for this source type"
+                ),
+                internal_detail=(
+                    f"source_type={source_type.value!r} has no entry in the "
+                    "deterministic SourceType -> capability map"
+                ),
+            )
         # STRIX F-5 / N-3: normalize tag ordering/duplicates at the
         # owning layer and convert any Pydantic ValidationError to a
         # deterministic 400 ``source_configuration_error`` instead of
@@ -233,6 +517,11 @@ class SourceManagementService:
                 tags=norm_tags,
                 asset_tags=norm_asset_tags,
                 retired_at=None,
+                capability_id=binding.capability_id,
+                capability_version=binding.capability_version,
+                mapping_profile_id=binding.mapping_profile_id,
+                capability_binding_status=CapabilityBindingStatus.BOUND,
+                capability_bound_at=now,
             )
         except PydanticValidationError as exc:
             raise SourceConfigurationError(
@@ -244,6 +533,16 @@ class SourceManagementService:
             ) from exc
         persisted = self._repository.create(inst)
         self._registry.register(persisted)
+        self._audit(
+            action="source_register",
+            source=persisted,
+            before={},
+            reason=(
+                f"capability binding {binding.capability_id!r} "
+                f"v{binding.capability_version}"
+            ),
+            actor=identity.subject_id,
+        )
         return persisted.to_view()
 
     def configure(
@@ -298,6 +597,7 @@ class SourceManagementService:
         """Validate the configured connection."""
         _require_role(identity, ADMIN_ROLE)
         current = self._registry.get_required(source_instance_id)
+        self._require_bound(current, "validation")
         if not can_transition(current.state, SourceState.VALIDATED):
             raise SourceInstanceStateError(
                 safe_message=(
@@ -359,6 +659,7 @@ class SourceManagementService:
         """Enable a source instance."""
         _require_role(identity, ADMIN_ROLE)
         current = self._registry.get_required(source_instance_id)
+        self._require_bound(current, "enablement")
         if not can_transition(current.state, SourceState.ENABLED):
             raise SourceInstanceStateError(
                 safe_message=(
@@ -511,6 +812,11 @@ class SourceManagementService:
                 ),
             )
         current = self._registry.get_required(source_instance_id)
+        # Phase 5.2: the capability-binding gate is evaluated BEFORE the
+        # lifecycle-state gate so a quarantined source always reports the
+        # specific, actionable reason (a missing capability binding) rather
+        # than the incidental state symptom. Both are 409 refusals.
+        self._require_bound(current, "token issuance")
         if current.state not in (
             SourceState.VALIDATED,
             SourceState.ENABLED,
@@ -526,8 +832,55 @@ class SourceManagementService:
         token = self._token_issuer.issue(
             source_instance_id=source_instance_id,
             source_type=current.source_type,
+            capability_id=current.capability_id,
         )
-        return self._token_issuer.pack(token)
+        packed = self._token_issuer.pack(token)
+        self._audit(
+            action="source_token_issue",
+            source=current,
+            reason=(
+                f"capability {current.capability_id!r} "
+                f"v{current.capability_version}"
+            ),
+            actor=identity.subject_id,
+        )
+        return packed
+
+    def rotate_ingress_token(
+        self,
+        *,
+        identity: Identity,
+        source_instance_id: SourceInstanceId,
+    ) -> str:
+        """Rotate a source's credential by issuing a fresh token.
+
+        Phase 5.2 rotation semantics (master plan §15/§19, as approved):
+        issuing a new token *is* the rotation. Source-identity tokens are
+        single-use and short-lived, so the previous token is either already
+        spent (replay-rejected) or expires within the documented window; no
+        separate revocation list is maintained in this phase. Retirement,
+        which must revoke *future* issuance, is enforced by the RETIRED
+        state gate in :meth:`issue_ingress_token` and by the ingress
+        boundary's retired-source check — so a token that was issued before
+        retirement still cannot ingest anything.
+
+        This method exists so the rotation intent is explicit and audited,
+        rather than being an undocumented side effect of "issue another
+        token".
+        """
+        current = self._registry.get_required(source_instance_id)
+        self._require_bound(current, "token rotation")
+        packed = self.issue_ingress_token(
+            identity=identity,
+            source_instance_id=source_instance_id,
+        )
+        self._audit(
+            action="source_token_rotate",
+            source=current,
+            reason="credential rotation issued a fresh single-use token",
+            actor=identity.subject_id,
+        )
+        return packed
 
     # ----------------------------------------------------------------- reload
     def reload_from_repository(self) -> int:

@@ -39,14 +39,23 @@ from pymongo.errors import (
 from ..config import ProShieldConfig
 from ..domain.errors import PersistenceError
 from ..domain.security_event import ALLOWED_SOURCES
+from ..persistence.human_ids import COUNTERS_COLLECTION, HumanIdAllocator
+from .audit import (
+    SOURCE_AUDIT_COLLECTION,
+    SOURCE_AUDIT_INDEX_SPECS,
+    SOURCE_AUDIT_VALIDATOR,
+)
 from .errors import (
     DuplicateSourceInstanceError,
     SourceInstanceNotFoundError,
     SourcePersistenceError,
 )
 from .models import (
+    CAPABILITY_ID_RE,
+    MAPPING_PROFILE_ID_RE,
     MAX_ASSET_TAGS,
     MAX_TAGS_PER_SOURCE,
+    CapabilityBindingStatus,
     SourceConnectionType,
     SourceInstance,
     SourceInstanceConfiguration,
@@ -82,6 +91,19 @@ INDEX_SPECS: List[Dict[str, Any]] = [
     {
         "name": "source_display_name",
         "key": [("display_name", ASCENDING)],
+    },
+    # Phase 5.2 — Source Architecture 2.0. The capability index makes the
+    # capability -> sources relationship queryable without a scan (the
+    # "derived view" the UI and the health probes use), and the binding
+    # status index makes the quarantine set (requires_verification)
+    # directly observable so it can never hide inside a full scan.
+    {
+        "name": "source_capability_id",
+        "key": [("capability_id", ASCENDING)],
+    },
+    {
+        "name": "source_capability_binding_status",
+        "key": [("capability_binding_status", ASCENDING)],
     },
 ]
 
@@ -199,6 +221,39 @@ SOURCE_INSTANCES_VALIDATOR: Dict[str, Any] = {
             "retired_at": {
                 "bsonType": ["date", "null"],
             },
+            # Capability patch gap 2: allocator-assigned human id.
+            "human_id": {
+                "bsonType": ["string", "null"], "maxLength": 32,
+            },
+            # Phase 5.2 — Source Architecture 2.0: capability binding.
+            # Each key is optional so untouched legacy rows keep
+            # validating; the application model is the authority for the
+            # cross-field invariant (bound <=> capability_id present).
+            "capability_id": {
+                "bsonType": ["string", "null"],
+                "minLength": 5,
+                "maxLength": 64,
+                "pattern": CAPABILITY_ID_RE,
+            },
+            "capability_version": {
+                "bsonType": ["int", "long", "null"],
+                "minimum": 1,
+            },
+            "mapping_profile_id": {
+                "bsonType": ["string", "null"],
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": MAPPING_PROFILE_ID_RE,
+            },
+            "capability_binding_status": {
+                "bsonType": "string",
+                "enum": sorted(
+                    s.value for s in CapabilityBindingStatus
+                ),
+            },
+            "capability_bound_at": {
+                "bsonType": ["date", "null"],
+            },
         },
     },
 }
@@ -218,6 +273,11 @@ class SourceRepository:
         self._collection: Collection = db[
             managed_source_collection_name(config.env_name)
         ]
+        # Capability patch gap 2: human-id assignment at persistence.
+        counters = db[COUNTERS_COLLECTION]
+        if not hasattr(counters, "find_one_and_update"):
+            counters = None
+        self._human_ids = HumanIdAllocator(counters, "source")
 
     # ----------------------------------------------------------------- schema
     def ensure_schema(self) -> None:
@@ -287,6 +347,122 @@ class SourceRepository:
                 ) from exc
         return created
 
+    # ----------------------------------------------------------------- audit
+    def audit_collection(self) -> Collection:
+        """The append-only Phase 5.2 source audit collection."""
+        return self._db[SOURCE_AUDIT_COLLECTION]
+
+    def ensure_audit_schema(self) -> bool:
+        """Apply the ``source_audit`` validator (idempotent).
+
+        Returns False when the backend cannot support it (in-memory
+        fakes) instead of raising, mirroring the bootstrap helper.
+        """
+        try:
+            existing = self._db.command(
+                "listCollections",
+                filter={"name": SOURCE_AUDIT_COLLECTION},
+            )
+            first = (existing.get("cursor", {}).get("firstBatch") or [])
+            if first:
+                self._db.command(
+                    "collMod",
+                    SOURCE_AUDIT_COLLECTION,
+                    validator=SOURCE_AUDIT_VALIDATOR,
+                    validationLevel="strict",
+                    validationAction="error",
+                )
+            else:
+                self._db.create_collection(
+                    SOURCE_AUDIT_COLLECTION,
+                    validator=SOURCE_AUDIT_VALIDATOR,
+                    validationLevel="strict",
+                    validationAction="error",
+                )
+            return True
+        except PyMongoError as exc:
+            raise PersistenceError(
+                safe_message="could not apply source audit validator",
+                internal_detail=f"{type(exc).__name__}: {exc}",
+            ) from exc
+
+    def ensure_audit_indexes(self) -> List[str]:
+        """Create the documented ``source_audit`` index set."""
+        created: List[str] = []
+        for spec in SOURCE_AUDIT_INDEX_SPECS:
+            try:
+                self._db[SOURCE_AUDIT_COLLECTION].create_index(
+                    spec["key"],
+                    name=spec["name"],
+                )
+                created.append(spec["name"])
+            except PyMongoError as exc:
+                raise PersistenceError(
+                    safe_message="could not create source_audit index",
+                    internal_detail=f"{type(exc).__name__}: {exc}",
+                ) from exc
+        return created
+
+    # ------------------------------------------------------------- migration
+    def iter_raw_documents(self) -> List[Dict[str, Any]]:
+        """Return the raw persisted documents (migration view).
+
+        The Phase 5.2 legacy backfill must be able to see **every** row,
+        including a row whose stored shape no longer parses into
+        :class:`SourceInstance` (``_document_to_instance`` quarantines such
+        rows with ``None``). Reading raw documents means a malformed legacy
+        row becomes an explicit REQUIRE- VERIFICATION decision instead of
+        silently disappearing from the migration's field of view.
+        """
+        try:
+            return [dict(doc) for doc in self._collection.find({})]
+        except PyMongoError as exc:
+            raise PersistenceError(
+                safe_message="could not read source instances",
+                internal_detail=f"{type(exc).__name__}: {exc}",
+            ) from exc
+
+    def set_capability_binding(
+        self,
+        source_instance_id: str,
+        *,
+        capability_id: Optional[str],
+        capability_version: Optional[int],
+        mapping_profile_id: Optional[str],
+        binding_status: str,
+        bound_at: Optional[datetime] = None,
+    ) -> int:
+        """Apply a capability binding to a persisted row (``$set`` only).
+
+        Deliberately narrow: the migration must not rewrite unrelated
+        historical fields (freeze §38 — preserve historical truth). A
+        targeted ``$set`` leaves ``source_type``, ``source``,
+        ``configuration``, timestamps and every other lineage field
+        byte-identical.
+
+        Returns the number of documents modified (0 or 1).
+        """
+        if not isinstance(source_instance_id, str) or not source_instance_id:
+            return 0
+        fields: Dict[str, Any] = {
+            "capability_binding_status": str(binding_status),
+            "capability_id": capability_id,
+            "capability_version": capability_version,
+            "mapping_profile_id": mapping_profile_id,
+            "capability_bound_at": bound_at,
+        }
+        try:
+            result = self._collection.update_one(
+                {"source_instance_id": source_instance_id},
+                {"$set": fields},
+            )
+            return int(getattr(result, "modified_count", 0))
+        except PyMongoError as exc:
+            raise PersistenceError(
+                safe_message="could not apply source capability binding",
+                internal_detail=f"{type(exc).__name__}: {exc}",
+            ) from exc
+
     # ----------------------------------------------------------------- writes
     def create(self, instance: SourceInstance) -> SourceInstance:
         """Persist a new instance; raise on duplicate."""
@@ -297,6 +473,10 @@ class SourceRepository:
                     f"expected SourceInstance, "
                     f"got {type(instance).__name__}"
                 ),
+            )
+        if not instance.human_id:
+            instance = instance.model_copy(
+                update={"human_id": self._human_ids.allocate()},
             )
         doc = instance.to_canonical_dict()
         try:
@@ -326,6 +506,11 @@ class SourceRepository:
                     f"expected SourceInstance, "
                     f"got {type(instance).__name__}"
                 ),
+            )
+        # Guarantee the human id survives round-trips (gap 2).
+        if not instance.human_id:
+            instance = instance.model_copy(
+                update={"human_id": self._human_ids.allocate()},
             )
         doc = instance.to_canonical_dict()
         try:
@@ -398,6 +583,29 @@ class SourceRepository:
             )
         return inst
 
+    def find_by_capability(
+        self, capability_id: str
+    ) -> List[SourceInstance]:
+        """Return every source instance bound to ``capability_id``.
+
+        Phase 5.2: the Capability -> SourceInstances relationship
+        (freeze §10.1). Unbound / quarantined rows carry no
+        ``capability_id`` so they can never appear as a member of a
+        capability they do not own.
+        """
+        if not isinstance(capability_id, str) or not capability_id:
+            return []
+        try:
+            cursor = self._collection.find(
+                {"capability_id": capability_id}
+            ).sort("created_at", 1)
+        except PyMongoError as exc:
+            raise PersistenceError(
+                safe_message="could not list source instances",
+                internal_detail=f"{type(exc).__name__}: {exc}",
+            ) from exc
+        return [d for d in (_document_to_instance(c) for c in cursor) if d]
+
     def find_by_state(self, state: SourceState) -> List[SourceInstance]:
         try:
             cursor = self._collection.find({"state": state.value})
@@ -441,8 +649,21 @@ def _document_to_instance(
     the raw secret ever leaving the model layer.
     """
     cleaned = {k: v for k, v in doc.items() if k != "_id"}
+    # Capability patch gap 2: wire-friendly None round-trips to "".
+    if cleaned.get("human_id") is None:
+        cleaned["human_id"] = ""
+    # Phase 5.2 — capability binding round-trip normalisation.
+    # A legacy row (or one written before the binding migration) has no
+    # ``capability_binding_status`` at all: it is loaded as ``unbound``,
+    # never as an invented ``bound``. An explicit JSON ``null`` is
+    # normalised the same way.
+    if not cleaned.get("capability_binding_status"):
+        cleaned["capability_binding_status"] = (
+            CapabilityBindingStatus.UNBOUND.value
+        )
     for ts_field in (
         "created_at", "updated_at", "last_validation_at", "retired_at",
+        "capability_bound_at",
     ):
         v = cleaned.get(ts_field)
         if isinstance(v, datetime) and v.tzinfo is None:

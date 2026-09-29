@@ -44,6 +44,10 @@ from .models import TimelineResult
 
 
 MAX_ITED_PER_INCIDENT = 256
+# Capability patch gap 13: per-kind fetch bound for the global
+# timeline query (bounded scan; the merged stream is paginated
+# afterwards).
+_GLOBAL_FETCH = 1000
 
 
 class TimelineReadService:
@@ -155,6 +159,134 @@ class TimelineReadService:
             correlations=correlations,
             now=now,
         )
+
+    def global_query(
+        self,
+        *,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        kinds: Optional[Tuple[str, ...]] = None,
+        limit: int = 200,
+        offset: int = 0,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Global (cross-case) timeline query (capability patch gap 13).
+
+        Aggregates the supported timeline event kinds from the
+        persistence layer in one bounded, deterministic read:
+
+        * ``event``       - canonical SecurityEvents (event_time),
+        * ``detection``   - Detections (detected_at),
+        * ``correlation`` - Correlations (correlated_at).
+
+        The merged stream is sorted newest-first, optionally
+        time/kind-filtered, and paginated with ``offset``/``limit``.
+        There is no case context here by definition (global scope);
+        no cross-case contamination is possible because every item
+        carries its own ids only.
+
+        Bounded: each source contributes at most ``_GLOBAL_FETCH``
+        rows before the merge, so the query cannot scan unbounded
+        history.
+        """
+        ref = now or datetime.now(timezone.utc)
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        allowed_kinds = ("event", "detection", "correlation")
+        selected = tuple(
+            k for k in (kinds or allowed_kinds) if k in allowed_kinds
+        ) or allowed_kinds
+
+        items: List[Dict[str, Any]] = []
+
+        def _in_window(ts: datetime) -> bool:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if since is not None:
+                s = since if since.tzinfo else since.replace(
+                    tzinfo=timezone.utc
+                )
+                if ts < s:
+                    return False
+            if until is not None:
+                u = until if until.tzinfo else until.replace(
+                    tzinfo=timezone.utc
+                )
+                if ts > u:
+                    return False
+            return True
+
+        if "event" in selected:
+            for ev in self._event_repo.find_recent(limit=_GLOBAL_FETCH):
+                ts = ev.event_time
+                if not _in_window(ts):
+                    continue
+                items.append({
+                    "kind": "event",
+                    "timestamp": ts.isoformat(),
+                    "item_id": ev.event_id,
+                    "title": str(ev.event_type),
+                    "source": str(ev.source),
+                    "detail": {
+                        "source_ip": ev.source_ip,
+                        "endpoint": ev.endpoint,
+                    },
+                })
+        if "detection" in selected:
+            for det in self._detection_service.repository.find_latest(
+                limit=_GLOBAL_FETCH,
+            ):
+                ts = det.detected_at
+                if not _in_window(ts):
+                    continue
+                items.append({
+                    "kind": "detection",
+                    "timestamp": ts.isoformat(),
+                    "item_id": det.detection_id,
+                    "human_id": det.human_id or None,
+                    "title": f"{det.rule_id} v{det.rule_version}",
+                    "detail": {
+                        "event_id": det.event_id,
+                        "severity": det.severity or None,
+                        "category": det.category.value,
+                    },
+                })
+        if "correlation" in selected:
+            for corr in self._correlation_service.repository.find_recent(
+                limit=_GLOBAL_FETCH,
+            ):
+                ts = corr.correlated_at
+                if not _in_window(ts):
+                    continue
+                items.append({
+                    "kind": "correlation",
+                    "timestamp": ts.isoformat(),
+                    "item_id": corr.correlation_id,
+                    "human_id": corr.human_id or None,
+                    "title": corr.pattern_id,
+                    "detail": {
+                        "count": corr.count,
+                        "key": list(corr.key.parts),
+                        "confidence": corr.confidence or None,
+                    },
+                })
+
+        items.sort(key=lambda i: i["timestamp"], reverse=True)
+        safe_limit = max(1, min(int(limit), 200))
+        safe_offset = max(0, int(offset))
+        page = items[safe_offset:safe_offset + safe_limit]
+        return {
+            "items": page,
+            "total_returned": len(page),
+            "total_matched": len(items),
+            "truncated": (
+                len(items) >= _GLOBAL_FETCH * len(selected)
+            ),
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "kinds": list(selected),
+            "produced_at": ref.isoformat(),
+        }
 
     def _resolve_events(
         self,

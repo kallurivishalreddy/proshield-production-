@@ -139,14 +139,24 @@ class TestCreateInputValidation:
 
 class TestCreateMock:
     def test_inserts_correlation(self, config, mock_db) -> None:
+        """Capability patch gaps 2+6: create() returns an enriched
+        copy with the persisted human id (CORR-<seq>) and the
+        SeverityEngine-composed confidence band."""
+        from app.severity.models import ConfidenceBand
+
         repo = CorrelationRepository(mock_db, config)
         c = _corr()
         result = repo.create(c)
-        assert result is c
+        assert result is not c
+        assert result.correlation_id == c.correlation_id
+        assert result.human_id == "CORR-000001"
+        assert c.human_id == ""  # input untouched
+        assert result.confidence in {b.value for b in ConfidenceBand}
         args, _ = mock_db.__getitem__("correlations").insert_one.call_args
         assert isinstance(args[0]["correlated_at"], datetime)
         assert isinstance(args[0]["window_start"], datetime)
         assert isinstance(args[0]["window_end"], datetime)
+        assert args[0]["human_id"] == "CORR-000001"
 
     def test_duplicate_key_raises_duplicate_event(self, config, mock_db) -> None:
         repo = CorrelationRepository(mock_db, config)

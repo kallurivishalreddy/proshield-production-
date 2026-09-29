@@ -119,6 +119,35 @@ class FakeSourceCollection:
     ) -> Any:
         return name
 
+    def find_one_and_update(
+        self,
+        query: Dict[str, Any],
+        update: Dict[str, Any],
+        *,
+        upsert: bool = False,
+        return_document: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        # V3-5.1 fix: mutate the STORED doc, not a find_one() copy.
+        target = None
+        for stored in self.docs:
+            if _match(stored, query):
+                target = stored
+                break
+        if target is None:
+            if not upsert:
+                return None
+            target = dict(query)
+            self.docs.append(target)
+        if "$set" in update:
+            target.update(copy.deepcopy(update["$set"]))
+        if "$inc" in update:
+            for k, v in update["$inc"].items():
+                target[k] = int(target.get(k) or 0) + int(v)
+        return copy.deepcopy(target)
+
+    def list_indexes(self) -> list:
+        return []
+
 
 class FakeSourceCursor:
     def __init__(self, docs: List[Dict[str, Any]]) -> None:

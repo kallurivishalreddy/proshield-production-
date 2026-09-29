@@ -30,11 +30,40 @@ class DomainError(Exception):
         internal_detail: Optional[str] = None,
         *,
         field: Optional[str] = None,
+        code: Optional[str] = None,
+        http_status: Optional[int] = None,
     ) -> None:
+        """Build a safe domain error.
+
+        ``code`` / ``http_status`` default to the subclass's class attributes
+        and exist so a caller can select a *more specific* documented code at
+        the raise site without constructing the wrong exception type.
+
+        2026-09-18 audit: this base signature previously accepted neither
+        keyword, yet the trusted ingress boundary already raised its
+        documented per-event rejections with
+        ``DomainValidationError(..., code=..., http_status=...)`` — every such
+        raise therefore blew up with
+        ``TypeError: DomainError.__init__() got an unexpected keyword argument
+        'code'``, was swallowed by the generic ``except Exception`` handler,
+        and reached the source as the opaque ``ingest_failed`` reason instead
+        of the documented ``validation_error``. Accepting the two keywords
+        restores the documented error contract for those call sites.
+        """
         super().__init__(safe_message)
         self.safe_message = safe_message
         self.internal_detail = internal_detail
         self.field = field
+        if code is not None:
+            if not isinstance(code, str) or not code:
+                raise ValueError("code must be a non-empty string")
+            self.code = code
+        if http_status is not None:
+            if not isinstance(http_status, int) or isinstance(http_status, bool):
+                raise ValueError("http_status must be an int")
+            if not (100 <= http_status <= 599):
+                raise ValueError("http_status must be a valid HTTP status code")
+            self.http_status = http_status
 
 
 class ValidationError(DomainError):

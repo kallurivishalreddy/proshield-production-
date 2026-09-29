@@ -127,13 +127,30 @@ class TestCreateInputValidation:
 
 class TestCreateMock:
     def test_inserts_detection(self, config, mock_db) -> None:
+        """Capability patch gap 2: create() returns an enriched copy
+        carrying the persisted human id (DET-<seq>); the input
+        (frozen) model is never mutated."""
         repo = DetectionRepository(mock_db, config)
         d = _det()
         result = repo.create(d)
-        assert result is d
+        assert result is not d
+        assert result.detection_id == d.detection_id
+        assert result.human_id == "DET-000001"
+        assert d.human_id == ""  # input untouched
         args, _ = mock_db.__getitem__("detections").insert_one.call_args
         assert args[0]["correlated"] is False
         assert isinstance(args[0]["detected_at"], datetime)
+        assert args[0]["human_id"] == "DET-000001"
+
+    def test_duplicate_create_does_not_burn_human_id(
+        self, config, mock_db,
+    ) -> None:
+        repo = DetectionRepository(mock_db, config)
+        mock_db.__getitem__("detections").insert_one.side_effect = (
+            DuplicateKeyError("dup")
+        )
+        with pytest.raises(DuplicateEventError):
+            repo.create(_det())
 
     def test_duplicate_key_raises_duplicate_event(self, config, mock_db) -> None:
         repo = DetectionRepository(mock_db, config)

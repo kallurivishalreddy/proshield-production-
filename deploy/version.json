@@ -1,0 +1,12 @@
+{
+  "product_name": "ProShield",
+  "version": "1.0.3",
+  "channel": "testing",
+  "publisher": "ProShield Security",
+  "update_mode": "automatic",
+  "update_manifest_url": "",
+  "analyst_port": 8088,
+  "ingress_port": 8089,
+  "mongo_uri": "mongodb://127.0.0.1:27017",
+  "mongo_db": "proshield"
+}

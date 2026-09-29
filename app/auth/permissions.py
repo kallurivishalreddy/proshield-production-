@@ -91,6 +91,10 @@ class Permission:
     SOURCE_READ = "source:read"
     SOURCE_WRITE = "source:write"
 
+    # Capability registry (Phase 5.1, admin writes; analyst/admin reads).
+    CAPABILITY_READ = "capability:read"
+    CAPABILITY_WRITE = "capability:write"
+
 
 ALL_PERMISSIONS: FrozenSet[str] = frozenset(
     v for k, v in vars(Permission).items()
@@ -115,6 +119,7 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         Permission.OVERVIEW_READ,
         Permission.RULE_READ,
         Permission.SOURCE_READ,
+        Permission.CAPABILITY_READ,
     }),
     ADMIN_ROLE: frozenset({
         Permission.CASE_READ,
@@ -137,12 +142,25 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         Permission.RULE_WRITE,
         Permission.SOURCE_READ,
         Permission.SOURCE_WRITE,
+        Permission.CAPABILITY_READ,
+        Permission.CAPABILITY_WRITE,
     }),
     # Collectors submit events but cannot read cases /
     # reports / routing.
-    COLLECTOR_ROLE: frozenset({
-        Permission.EVENT_READ,  # can read its own submitted events
-    }),
+    #
+    # OWNER-52-02 (Phase 5.2 baseline): the collector role carries NO
+    # analyst-plane read permission. A collector is a SOURCE identity
+    # (docs/PHASE 3/AUTH_RBAC.md §10-§12): it authenticates to the
+    # ingestion boundary, submits SecurityEvents and reads the
+    # ingestion response. There is no wire link from a collector
+    # *subject* to the events it submitted (events are attributed by
+    # `provenance.source_instance_id`, a source credential, not a
+    # session subject), so the previous `event:read` grant could not be
+    # scoped to "its own submitted events" and in practice exposed every
+    # recently ingested event to a semi-trusted role. Minimum-permission
+    # is the documented direction, so the grant was removed rather than
+    # left unscoped.
+    COLLECTOR_ROLE: frozenset(),
     # Internal services get the full read surface minus
     # override / write.
     INTERNAL_SERVICE_ROLE: frozenset({
@@ -156,6 +174,7 @@ ROLE_PERMISSIONS: Dict[str, FrozenSet[str]] = {
         Permission.OVERVIEW_READ,
         Permission.RULE_READ,
         Permission.SOURCE_READ,
+        Permission.CAPABILITY_READ,
     }),
 }
 

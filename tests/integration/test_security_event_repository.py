@@ -110,6 +110,51 @@ def test_idempotent_re_ingest_returns_duplicate_error(
     assert ei.value.existing.event_id == e.event_id
 
 
+def test_idempotent_reingest_with_submillisecond_event_time(
+    repository: SecurityEventRepository,
+) -> None:
+    """AUD-01 regression: BSON stores datetimes at millisecond precision.
+
+    A genuine re-delivery of the SAME source event (fresh SecurityEvent
+    instance, identical content, event_time carrying sub-millisecond
+    microseconds) must be classified as an idempotent duplicate — NOT as
+    a conflicting replay — even though the stored event_time was
+    truncated to milliseconds by MongoDB.
+    """
+    et = datetime(2026, 9, 17, 12, 0, 0, 123456, tzinfo=timezone.utc)
+    e1 = _make_event(event_id=str(uuid7()), event_time=et)
+    e2 = _make_event(
+        event_id=e1.event_id,
+        event_time=et,
+        source_event_id=e1.provenance.source_event_id,
+    )
+    # e1/e2 are distinct instances with identical content (frozen model
+    # equality makes them ==); each create() rebuilds the canonical
+    # payload from its own instance, which is what a re-delivery does.
+    repository.create(e1)
+    with pytest.raises(DuplicateEventError) as ei:
+        repository.create(e2)
+    assert ei.value.existing.event_id == e1.event_id
+
+
+def test_conflict_still_detected_for_materially_different_event_time(
+    repository: SecurityEventRepository,
+) -> None:
+    """The AUD-01 fix must not weaken tamper detection: a re-delivery
+    claiming the same event_id with a materially different event_time
+    (whole milliseconds apart) is still a conflicting replay.
+    """
+    e1 = _make_event(event_id=str(uuid7()))
+    e2 = _make_event(
+        event_id=e1.event_id,
+        event_time=e1.event_time.replace(microsecond=500_000),
+        source_event_id=e1.provenance.source_event_id,
+    )
+    repository.create(e1)
+    with pytest.raises(ConflictEventError):
+        repository.create(e2)
+
+
 def test_conflict_on_same_event_id_different_content(
     repository: SecurityEventRepository,
 ) -> None:

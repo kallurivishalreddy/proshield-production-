@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ProShield - starting</title>
+<style>
+  :root {
+    --bg: #0b1220;
+    --panel: #111c31;
+    --panel-2: #16233c;
+    --line: #22304d;
+    --text: #e6edf7;
+    --muted: #8fa3c0;
+    --ok: #35d07f;
+    --warn: #f4b942;
+    --bad: #ff5f6d;
+    --accent: #4c8dff;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: radial-gradient(1200px 600px at 20% -10%, #16233c 0%, var(--bg) 60%);
+    color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    padding: 32px;
+  }
+  .card { width: min(920px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 28px 30px 22px; box-shadow: 0 24px 60px rgba(0,0,0,.45); }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; }
+  .logo { width: 40px; height: 40px; border-radius: 10px; background: linear-gradient(135deg, var(--accent), #7cc6ff); display: grid; place-items: center; font-weight: 700; font-size: 18px; color: #05101f; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: .3px; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .state { display: flex; align-items: center; gap: 10px; margin: 18px 0 14px; padding: 12px 14px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 4px rgba(244,185,66,.15); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .state.ready .dot { background: var(--ok); box-shadow: 0 0 0 4px rgba(53,208,127,.15); animation: none; }
+  .state.bad .dot { background: var(--bad); box-shadow: 0 0 0 4px rgba(255,95,109,.15); }
+  .state strong { font-size: 14px; }
+  .state span { color: var(--muted); font-size: 12.5px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  td { padding: 9px 4px; border-bottom: 1px solid var(--line); font-size: 13px; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.k { color: var(--muted); width: 210px; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; border: 1px solid transparent; }
+  .pill.ok { background: rgba(53,208,127,.12); color: var(--ok); border-color: rgba(53,208,127,.35); }
+  .pill.bad { background: rgba(255,95,109,.12); color: var(--bad); border-color: rgba(255,95,109,.35); }
+  .pill.warn { background: rgba(244,185,66,.12); color: var(--warn); border-color: rgba(244,185,66,.35); }
+  .pill.idle { background: rgba(143,163,192,.12); color: var(--muted); border-color: rgba(143,163,192,.3); }
+  code { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; color: #b9cbe6; word-break: break-all; }
+  .actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+  button { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); padding: 8px 14px; border-radius: 8px; font-size: 12.5px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  footer { margin-top: 18px; color: var(--muted); font-size: 11.5px; border-top: 1px solid var(--line); padding-top: 12px; }
+  details { margin-top: 12px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+  details table { margin-top: 10px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <header>
+      <div class="logo">PS</div>
+      <div>
+        <h1>ProShield</h1>
+        <div class="sub" id="version-line">Detecting version&hellip;</div>
+      </div>
+    </header>
+
+    <div class="state" id="state-box">
+      <div class="dot"></div>
+      <div>
+        <strong id="state-title">Starting ProShield</strong><br />
+        <span id="state-detail">Connecting to the local ProShield service&hellip;</span>
+      </div>
+    </div>
+
+    <table>
+      <tr><td class="k">ProShield Service (Windows)</td><td><span class="pill idle" id="svc-service">checking</span> <code id="svc-service-note"></code></td></tr>
+      <tr><td class="k">Analyst / SecureProxy plane</td><td><span class="pill idle" id="svc-analyst">checking</span> <code id="svc-analyst-note"></code></td></tr>
+      <tr><td class="k">Ingress / trust boundary</td><td><span class="pill idle" id="svc-ingress">checking</span> <code id="svc-ingress-note"></code></td></tr>
+      <tr><td class="k">MongoDB (127.0.0.1:27017)</td><td><span class="pill idle" id="svc-mongo">checking</span> <code id="svc-mongo-note"></code></td></tr>
+      <tr><td class="k">Update channel</td><td><span class="pill idle" id="svc-update">checking</span> <code id="svc-update-note"></code></td></tr>
+    </table>
+
+    <div class="actions">
+      <button onclick="retry()">Retry connection</button>
+      <button onclick="openLogs()">Open log folder</button>
+      <button onclick="openData()">Open data folder</button>
+    </div>
+
+    <details>
+      <summary>About / System information</summary>
+      <table>
+        <tr><td class="k">Product</td><td id="sys-product"></td></tr>
+        <tr><td class="k">Version / channel</td><td id="sys-version"></td></tr>
+        <tr><td class="k">Build id</td><td id="sys-build"></td></tr>
+        <tr><td class="k">Git commit</td><td id="sys-commit"></td></tr>
+        <tr><td class="k">Install location</td><td><code id="sys-install"></code></td></tr>
+        <tr><td class="k">Runtime data</td><td><code id="sys-data"></code></td></tr>
+        <tr><td class="k">Logs</td><td><code id="sys-logs"></code></td></tr>
+        <tr><td class="k">UI served by</td><td><code id="sys-ui"></code></td></tr>
+      </table>
+      <p class="sub" style="margin-top:10px">
+        The desktop shell is a native Windows window around the authoritative
+        ProShield web UI. It never connects to MongoDB and never bypasses the
+        SecureProxy wire boundary.
+      </p>
+    </details>
+
+    <footer id="footer">Waiting for the ProShield service&hellip;</footer>
+  </div>
+
+<script>
+  let navigated = false;
+
+  function setPill(id, state, note) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.className = "pill " + state;
+    el.textContent = {
+      ok: "healthy", bad: "unavailable", warn: "degraded", idle: "unknown"
+    }[state] || state;
+    const noteEl = document.getElementById(id + "-note");
+    if (noteEl) noteEl.textContent = note ? " " + note : "";
+  }
+
+  function api() {
+    return (window.pywebview && window.pywebview.api) ? window.pywebview.api : null;
+  }
+
+  async function retry() {
+    const a = api();
+    if (a) await a.retry();
+  }
+  async function openLogs() { const a = api(); if (a) await a.open_logs_folder(); }
+  async function openData() { const a = api(); if (a) await a.open_data_folder(); }
+
+  async function refresh() {
+    const a = api();
+    if (!a) {
+      document.getElementById("state-detail").textContent =
+        "Waiting for the native shell to finish initialising\u2026";
+      return;
+    }
+    let s;
+    try {
+      s = await a.status();
+    } catch (e) {
+      document.getElementById("state-detail").textContent = "Shell status unavailable: " + e;
+      return;
+    }
+    if (!s) return;
+
+    document.getElementById("version-line").textContent =
+      s.shell.product_name + " " + s.shell.display_version +
+      "  \u00b7  build " + s.shell.build_id;
+    document.getElementById("sys-product").textContent = s.shell.product_name + " (" + (s.shell.frozen ? "installed" : "development") + ")";
+    document.getElementById("sys-version").textContent = s.shell.display_version;
+    document.getElementById("sys-build").textContent = s.shell.build_id;
+    document.getElementById("sys-commit").textContent = s.shell.git_commit;
+    document.getElementById("sys-install").textContent = s.paths.install_root;
+    document.getElementById("sys-data").textContent = s.paths.data_root;
+    document.getElementById("sys-logs").textContent = s.paths.logs_dir;
+    document.getElementById("sys-ui").textContent = s.backend.ui_url;
+
+    // Windows service
+    const svc = s.service || {};
+    if (svc.installed && svc.state === "running") setPill("svc-service", "ok", svc.name);
+    else if (svc.installed) setPill("svc-service", "warn", svc.state);
+    else setPill("svc-service", "warn", "not registered (console/debug mode)");
+
+    // Planes
+    const analyst = s.backend.analyst || {};
+    setPill("svc-analyst", analyst.reachable ? "ok" : (analyst.port_open ? "warn" : "bad"),
+            "127.0.0.1:" + analyst.port + "  " + (analyst.detail || ""));
+
+    const ingress = s.backend.ingress || {};
+    setPill("svc-ingress", ingress.reachable ? "ok" : (ingress.port_open ? "warn" : "bad"),
+            "127.0.0.1:" + ingress.port + "  " + (ingress.detail || ""));
+
+    // MongoDB, from the supervisor status file / health payload
+    const mongo = (s.supervisor && s.supervisor.mongo) || {};
+    if (mongo.ready) setPill("svc-mongo", "ok", mongo.db || "");
+    else if (mongo.uri) setPill("svc-mongo", "warn", "not confirmed ready");
+    else setPill("svc-mongo", "idle", "no supervisor status yet");
+
+    // Update channel
+    const up = s.update || {};
+    if (!up.channel) setPill("svc-update", "idle", "");
+    else {
+      const pill = (up.status === "success" || up.status === "up-to-date") ? "ok"
+                 : (up.status === "error" || up.status === "failed" || up.status === "rejected") ? "warn"
+                 : "idle";
+      setPill("svc-update", pill,
+        up.mode + " \u00b7 " + up.channel + " \u00b7 " + (up.status || "idle") +
+        (up.available_version ? " \u2192 " + up.available_version : ""));
+    }
+
+    const box = document.getElementById("state-box");
+    box.className = "state" + (s.ready ? " ready" : "");
+    document.getElementById("state-title").textContent = s.ready
+      ? "ProShield is ready"
+      : "Starting ProShield";
+    document.getElementById("state-detail").textContent = s.ready
+      ? "Loading the security workspace\u2026"
+      : "Waiting for the analyst plane on 127.0.0.1:" + s.backend.analyst.port;
+    document.getElementById("footer").textContent = s.ready
+      ? "Ready \u00b7 last checked " + new Date().toLocaleTimeString()
+      : "Waiting for the ProShield service \u00b7 last checked " + new Date().toLocaleTimeString();
+  }
+
+  // Poll the shell for real state; the shell navigates the window itself once
+  // the backend is reachable, so this page disappears on success.
+  setInterval(refresh, 1500);
+  window.addEventListener("pywebviewready", refresh);
+  refresh();
+</script>
+</body>
+</html>

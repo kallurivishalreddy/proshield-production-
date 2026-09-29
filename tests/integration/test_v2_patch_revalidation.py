@@ -615,13 +615,24 @@ class TestV2P0UnmatchedVisibility:
         )
 
 
-# ------------------------------------------------------------- V2-19
+# ------------------------------------------------------------- V2-19 / AUD-CL-02
 class TestV2P0EndpointMismatch:
-    def test_source_ip_preserved_when_endpoint_mismatches(
+    def test_observations_preserved_when_endpoint_mismatches(
         self, config, v2_mongo, proxy_client, ingress_client
     ):
-        """V2-19: wire endpoint != registered endpoint preserves the
-        attacker source_ip and records the mismatch."""
+        """V2-19 + AUD-CL-02: a wire path that differs from the registered
+        configuration endpoint must PRESERVE the observation.
+
+        V2-19 already established this for ``source_ip`` (nulling it broke
+        every brute-force correlation — a systematic false-negative). The
+        2026-09-18 audit found the same class of defect for ``endpoint``:
+        the canonical field was overwritten with the source's *connection*
+        endpoint (``configuration.endpoint``), which made
+        NGINX-ACCESS-DENIED-001 / NGINX-AUTH-BRUTEFORCE-001 unreachable,
+        keyed correlation on the webhook URL, and falsified evidence. The
+        mismatch is now recorded (``details._registered_endpoint``) without
+        discarding the observation.
+        """
         admin = _admin(proxy_client)
         # Registered endpoint deliberately DIFFERENT from the wire one.
         sid = _register_source(
@@ -648,7 +659,12 @@ class TestV2P0EndpointMismatch:
             "V2-19 regression: attacker source_ip nulled on endpoint "
             "mismatch (systematic correlation false-negative)"
         )
-        assert doc["details"].get("_untrusted_endpoint") == "/wire/login"
+        assert doc["endpoint"] == "/wire/login", (
+            "AUD-CL-02 regression: the observed request path was replaced by "
+            "the source's connection endpoint (detection false-negative + "
+            "wrong correlation key + false evidence)"
+        )
+        assert doc["details"].get("_registered_endpoint") == "/registered/path"
 
 
 # ------------------------------------------------------------- V2-05

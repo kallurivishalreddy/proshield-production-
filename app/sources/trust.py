@@ -87,6 +87,7 @@ def _canonical_body(
     expires_at: datetime,
     nonce: str,
     key_id: str = "k1",
+    capability_id: Optional[str] = None,
 ) -> bytes:
     body = {
         "token_id": token_id,
@@ -98,6 +99,13 @@ def _canonical_body(
         "nonce": nonce,
         "key_id": key_id,
     }
+    # Phase 5.2: the capability is part of the signed claim *only when the
+    # source is bound*. Omitting the key entirely (rather than signing a
+    # null) keeps a pre-Phase-5.2 token's canonical body byte-identical, so
+    # a token issued by an older build still verifies during a rolling
+    # deployment instead of failing as a signature mismatch.
+    if capability_id is not None:
+        body["capability_id"] = capability_id
     return json.dumps(
         body,
         sort_keys=True,
@@ -149,9 +157,17 @@ class SourceIdentityTokenIssuer:
         *,
         source_instance_id: SourceInstanceId,
         source_type: SourceType,
+        capability_id: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> SourceIdentityToken:
-        """Issue a fresh token for a registered source instance."""
+        """Issue a fresh token for a registered source instance.
+
+        Phase 5.2: when the source instance is bound to a capability the
+        binding is included in the *signed* claim, so a token can never be
+        replayed against a different capability (the signature covers it)
+        and the ingress boundary can prove which capability the authenticated
+        source owned at issuance time.
+        """
         if now is None:
             now = datetime.now(timezone.utc)
         elif now.tzinfo is None:
@@ -174,6 +190,7 @@ class SourceIdentityTokenIssuer:
             expires_at=expires_at,
             nonce=nonce,
             key_id=self.key_id,
+            capability_id=capability_id,
         )
         signature = _compute_signature(self.secret, body)
         return SourceIdentityToken(
@@ -181,6 +198,7 @@ class SourceIdentityTokenIssuer:
             source_instance_id=source_instance_id,
             source_type=source_type.value,
             source=source_string_for_type(source_type),
+            capability_id=capability_id,
             issued_at=now,
             not_before=now,
             expires_at=expires_at,
@@ -201,6 +219,7 @@ class SourceIdentityTokenIssuer:
             expires_at=token.expires_at,
             nonce=token.nonce,
             key_id=key_id,
+            capability_id=getattr(token, "capability_id", None),
         )
         signature = _compute_signature(self.secret, body)
         encoded_body = _b64url(body)
@@ -382,6 +401,7 @@ class SourceIdentityTokenVerifier:
                 source_instance_id=body["source_instance_id"],
                 source_type=body["source_type"],
                 source=body["source"],
+                capability_id=body.get("capability_id"),
                 issued_at=issued_at,
                 not_before=issued_at,
                 expires_at=expires_at,
@@ -454,6 +474,30 @@ class SourceIdentityTokenVerifier:
                         f"source={r_source!r}) "
                         f"token=(type={token.source_type!r} "
                         f"source={token.source!r})"
+                    ),
+                )
+            # Phase 5.2 capability cross-check. A token that was signed
+            # against capability X must not authenticate a source instance
+            # whose *current* binding is capability Y: that is a stale (or
+            # forged) credential and it is rejected before any telemetry is
+            # accepted. A token with no capability claim (issued before the
+            # source was bound) is allowed through — the ingress boundary
+            # then derives the capability from the authenticated source
+            # instance rather than from the token.
+            r_capability = getattr(registered, "capability_id", None)
+            if (
+                token.capability_id is not None
+                and r_capability is not None
+                and token.capability_id != r_capability
+            ):
+                raise SourceIdentityTokenError(
+                    safe_message=(
+                        "source identity token does not match the "
+                        "registered source capability"
+                    ),
+                    internal_detail=(
+                        f"token_capability={token.capability_id!r} "
+                        f"registered_capability={r_capability!r}"
                     ),
                 )
         # R-1: replay protection. The first use is accepted; any

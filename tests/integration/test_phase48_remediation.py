@@ -26,13 +26,21 @@ import pytest
 TEST_DB = os.environ.get(
     "PROSHIELD_TEST_DB", "proshield_test_phase48_remediation",
 )
-os.environ.setdefault("PROSHIELD_MONGO_URI", "mongodb://127.0.0.1:27017")
+# Captured at import time. The root ``conftest.py`` deliberately scrubs ambient
+# ``PROSHIELD_*`` variables (autouse fixture) so a developer machine cannot
+# silently change what a test observes. Reading ``os.environ[...]`` at *call*
+# time therefore breaks: the module-level ``setdefault`` below runs at import
+# (before any fixture), and the scrub then removes the variable again. Holding
+# the resolved URI in a module constant keeps this test hermetic without
+# weakening the scrub for every other test.
+MONGO_URI = os.environ.get("PROSHIELD_MONGO_URI", "mongodb://127.0.0.1:27017")
+os.environ.setdefault("PROSHIELD_MONGO_URI", MONGO_URI)
 os.environ.setdefault("PROSHIELD_MONGO_DB", TEST_DB)
 
 
 def _drop_db() -> None:
     from pymongo import MongoClient
-    MongoClient(os.environ["PROSHIELD_MONGO_URI"]).drop_database(TEST_DB)
+    MongoClient(MONGO_URI).drop_database(TEST_DB)
 
 
 def _config():
@@ -41,7 +49,7 @@ def _config():
     from app.proxy import MAX_PROXY_REQUEST_BYTES
     return ProShieldConfig(
         env_name="remediation-test",
-        mongo_uri=os.environ["PROSHIELD_MONGO_URI"],
+        mongo_uri=MONGO_URI,
         mongo_db=TEST_DB,
         mongo_collection_events="security_events",
         auth_signing_key=new_development_signing_key(),

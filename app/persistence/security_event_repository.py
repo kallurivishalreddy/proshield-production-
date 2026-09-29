@@ -14,8 +14,10 @@ Reference: docs/PHASE 2/CONTRACT_DECISIONS.md (ADR-001, ADR-002),
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
+from pydantic import ValidationError as PydanticValidationError
 from pymongo import ASCENDING, DESCENDING
 from pymongo.collection import Collection
 from pymongo.database import Database
@@ -39,6 +41,8 @@ from ..domain.security_event import (
     validate_size_constraints,
 )
 from .schema import SECURITY_EVENTS_VALIDATOR
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -336,9 +340,26 @@ class SecurityEventRepository:
                 safe_message="could not list recent events",
                 internal_detail=f"find failed: {type(exc).__name__}",
             ) from exc
-        return [
-            d for d in (_document_to_event(c) for c in cursor) if d
-        ]
+        # Quarantine policy (matches the incident / correlation
+        # repositories): a poisoned legacy document is logged and
+        # skipped — it must never crash a bounded read path.
+        out: List[SecurityEvent] = []
+        for doc in cursor:
+            try:
+                event = _document_to_event(doc)
+            except (PydanticValidationError, ValueError, TypeError) as exc:
+                _log.warning(
+                    "security_event.document_quarantined",
+                    extra={
+                        "event_id": doc.get("event_id"),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:512],
+                    },
+                )
+                continue
+            if event is not None:
+                out.append(event)
+        return out
 
     def count(self) -> int:
         try:
@@ -375,22 +396,51 @@ def _document_to_event(doc: Dict[str, Any]) -> SecurityEvent:
 
 # Local datetime import for the helper above; kept here rather than
 # at module top to avoid a circular import surprise.
-from datetime import datetime  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+
+
+def _ms_precision(value: Any) -> Any:
+    """Normalize a datetime to millisecond precision (BSON storage precision).
+
+    MongoDB stores BSON datetimes at millisecond precision, so a value
+    round-tripped through the database loses any sub-millisecond digits.
+    An idempotent re-delivery of the SAME source event must not be
+    classified as a conflicting replay just because the freshly built
+    payload still carries microseconds.  Non-datetime values compare
+    unchanged.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        ms = (value.microsecond // 1000) * 1000
+        return value.replace(microsecond=ms)
+    return value
 
 
 def _canonical_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     """Equality check on the canonical dict form of an event.
 
     Used to detect the documented idempotency case
-    (same event_id, same SOURCE content).  ``ingested_at`` is
-    server-side bookkeeping that the ingestion service stamps
-    per-call, so it is excluded from the comparison: otherwise every
-    idempotent re-delivery would be (incorrectly) classified as a
-    conflicting replay.
+    (same event_id, same SOURCE content).
+
+    Two storage artifacts are normalized so a genuine re-delivery of the
+    same event is not misclassified as a conflicting replay (T02):
+
+    * ``ingested_at`` — server-side bookkeeping that the ingestion
+      service stamps per-call, so it is excluded entirely;
+    * ``event_time`` — compared at BSON (millisecond) precision,
+      because MongoDB truncates sub-millisecond digits on write.
+
+    Any other difference (including a materially different event_time)
+    still raises :class:`ConflictEventError`.
     """
     excluded = {"ingested_at"}
     keys = (set(a) | set(b)) - excluded
     for k in keys:
+        if k == "event_time":
+            if _ms_precision(a.get(k)) != _ms_precision(b.get(k)):
+                return False
+            continue
         if a.get(k) != b.get(k):
             return False
     return True

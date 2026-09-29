@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict
 
 import pytest
@@ -569,11 +569,20 @@ class TestIngressRateLimit:
         assert r.body["error"]["code"] == "validation_error"
         assert "too many events" in r.body["error"]["message"]
 
-    def test_st04_untrusted_endpoint_reconciled(self) -> None:
-        """ST-04: source-reported ``endpoint`` that does NOT
-        match the registered source configuration is recorded
-        under ``details._untrusted_endpoint`` and is NOT
-        promoted to the canonical ``endpoint`` field.
+    def test_st04_observed_endpoint_is_preserved_and_mismatch_recorded(self) -> None:
+        """2026-09-18 audit (AUD-CL-02): the *observed* ``endpoint`` and
+        ``asset`` are evidence and must reach the canonical event; the
+        disagreement with the registered source configuration is recorded
+        for the operator.
+
+        The previous ST-04 implementation discarded a non-matching wire
+        ``endpoint`` and stamped the source's *connection* endpoint
+        (``configuration.endpoint`` — the collector/webhook URL) onto the
+        event instead. That made NGINX-ACCESS-DENIED-001 and
+        NGINX-AUTH-BRUTEFORCE-001 unreachable (both predicates inspect the
+        observed path), keyed brute-force correlation on the webhook URL, and
+        falsified analyst-facing evidence. Identity/provenance fields stay
+        token-derived — that is the ST-04 boundary and it is untouched.
         """
         reg = SourceRegistry()
         inst = _enabled_nginx_instance()
@@ -591,17 +600,146 @@ class TestIngressRateLimit:
                 "event_time": "2026-08-30T12:00:00Z",
                 "endpoint": "https://evil.example.com/leak",
                 "asset": "web-app",
+                "source": "waf",
             }]},
         ))
         assert r.status == 200
         accepted_id = r.body["data"]["accepted_event_ids"][0]
-        # The untrusted endpoint was recorded in details.
         repo = proxy._ingestion_service._repository  # type: ignore[attr-defined]
         ev = repo.get_by_event_id(accepted_id)
         assert ev is not None
-        assert ev.details.get("_untrusted_endpoint") == (
-            "https://evil.example.com/leak"
+        # The observation is preserved verbatim (no substitution) ...
+        assert ev.endpoint == "https://evil.example.com/leak"
+        assert ev.asset == "web-app"
+        # ... the configuration mismatch is still recorded truthfully ...
+        assert ev.details.get("_registered_endpoint") == (
+            "https://example.com/api/ingest"
         )
+        # ... and identity/provenance remain server-derived (ST-04 intact):
+        # the payload's ``source: waf`` never becomes the event's source.
+        assert ev.source == "nginx"
+        assert ev.provenance.source_instance_id == (
+            inst.source_instance_id
+        )
+
+    def test_absent_wire_endpoint_falls_back_to_registered_configuration(self) -> None:
+        """No observation -> the configuration view is used (and no
+        mismatch marker is invented)."""
+        reg = SourceRegistry()
+        inst = _enabled_nginx_instance()
+        reg.register(inst)
+        proxy = _proxy(registry=reg)
+        token = _issue(_issuer(), inst)
+        r = proxy.handle(IngressRequest(
+            operation=OP_INGEST,
+            headers={INGRESS_HEADER_AUTHORIZATION: f"Bearer {token}"},
+            body={"events": [{
+                "event_type": "authentication_failure",
+                "event_id": "0198c2a1-7e3b-7a8e-b7b6-4f6a7d4d5fa2",
+                "event_time": "2026-08-30T12:00:01Z",
+                "source_ip": "203.0.113.9",
+            }]},
+        ))
+        assert r.status == 200
+        accepted_id = r.body["data"]["accepted_event_ids"][0]
+        repo = proxy._ingestion_service._repository  # type: ignore[attr-defined]
+        ev = repo.get_by_event_id(accepted_id)
+        assert ev is not None
+        assert ev.endpoint == "https://example.com/api/ingest"
+        assert ev.asset == "web-app"
+        assert "_registered_endpoint" not in ev.details
+class TestIngressErrorSemantics:
+    """AUD-CL-03 regression (2026-09-18 baseline audit).
+
+    The trusted ingress boundary raised its documented per-event rejections
+    with ``DomainValidationError(..., code=..., http_status=...)``, but
+    ``app.domain.errors.DomainError.__init__`` accepted neither keyword. Every
+    such raise therefore died with
+    ``TypeError: ... unexpected keyword argument 'code'``, was swallowed by the
+    generic handler and reached the source as the opaque ``ingest_failed``.
+    Pydantic failures raised while shaping the canonical event behaved the
+    same way. These tests pin the truthful contract:
+
+      * a malformed event is rejected with the documented ``validation_error``
+        reason, never ``ingest_failed``;
+      * a canonical-model failure (bad id / future-dated time) is translated
+        into the same documented reason;
+      * ``DomainError`` accepts and validates per-raise-site overrides.
+    """
+
+    def test_domain_error_accepts_per_site_code_and_status(self) -> None:
+        from app.domain.errors import ValidationError as DomainValidationError
+
+        err = DomainValidationError(
+            safe_message="x", internal_detail="y", field="f",
+            code="custom_code", http_status=422,
+        )
+        assert err.code == "custom_code"
+        assert err.http_status == 422
+        default = DomainValidationError(safe_message="x")
+        assert default.code == "validation_error"
+        assert default.http_status == 400
+        with pytest.raises(ValueError):
+            DomainValidationError(safe_message="x", code="")
+        with pytest.raises(ValueError):
+            DomainValidationError(safe_message="x", http_status=999)
+
+    def _reject(self, proxy, inst, payload):  # noqa: ANN001
+        r = proxy.handle(IngressRequest(
+            operation=OP_INGEST,
+            headers={INGRESS_HEADER_AUTHORIZATION: f"Bearer {_issue(_issuer(), inst)}"},
+            body={"events": [payload]},
+        ))
+        assert r.status == 200, r.body
+        return r.body["data"]["rejected"]
+
+    def test_malformed_events_report_validation_error(self) -> None:
+        reg = SourceRegistry()
+        inst = _enabled_nginx_instance()
+        reg.register(inst)
+        proxy = _proxy(registry=reg)
+        cases = (
+            ({"event_time": "2026-08-30T12:00:00Z"}, "missing event_type"),
+            (
+                {"event_type": "not_a_real_type", "event_time": "2026-08-30T12:00:00Z"},
+                "unknown event_type",
+            ),
+            (
+                {"event_type": "request_blocked", "event_time": "2026-08-30T99:99:99Z"},
+                "malformed event_time",
+            ),
+        )
+        for payload, label in cases:
+            rejected = self._reject(proxy, inst, payload)
+            assert len(rejected) == 1, (label, rejected)
+            assert rejected[0]["reason"] == "validation_error", (label, rejected)
+
+    def test_canonical_model_failures_report_validation_error(self) -> None:
+        reg = SourceRegistry()
+        inst = _enabled_nginx_instance()
+        reg.register(inst)
+        proxy = _proxy(registry=reg)
+        future = (
+            datetime.now(timezone.utc) + timedelta(hours=2)
+        ).isoformat().replace("+00:00", "Z")
+        cases = (
+            (
+                {"event_type": "request_blocked", "event_time": "2026-08-30T12:00:00Z",
+                 "event_id": "not-a-uuid"},
+                "invalid event_id",
+            ),
+            (
+                {"event_type": "request_blocked", "event_time": future,
+                 "event_id": "0198c2a1-7e3b-7a8e-b7b6-4f6a7d4dc1aa"},
+                "future-dated event_time (clock-skew guard)",
+            ),
+        )
+        for payload, label in cases:
+            rejected = self._reject(proxy, inst, payload)
+            assert len(rejected) == 1, (label, rejected)
+            assert rejected[0]["reason"] == "validation_error", (label, rejected)
+
+
 class TestIngressCaseInsensitiveHeaders:
     """STRIX D-2 regression: ``_extract_token`` must accept
     lowercased header keys exactly as a real HTTP server delivers

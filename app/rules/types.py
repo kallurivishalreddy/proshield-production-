@@ -25,7 +25,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import (
     BaseModel,
@@ -59,6 +59,11 @@ MAX_RULE_TAGS = 16
 MAX_RULE_TAG_LEN = 64
 MAX_RULE_REFERENCES = 16
 MAX_RULE_REFERENCE_LEN = 512
+
+# Phase 5.2: the capability id contract is shared with the capability
+# registry (``app.capabilities.models.CAPABILITY_ID_RE``) so a rule can
+# only ever name a real ``cap-<slug>`` entry.
+_CAPABILITY_ID_PATTERN = re.compile(r"^cap-[a-z][a-z0-9-]{1,47}$")
 MAX_RULE_REASONING_LEN = 2048
 MAX_RULE_EVAL_TARGETS = 256  # bound the size of an evaluation result
 
@@ -233,6 +238,25 @@ class RuleMetadata(BaseModel):
     references: Tuple[str, ...] = Field(default_factory=tuple)
     state: RuleState = RuleState.CANDIDATE
     enabled: bool = False
+    # --- Phase 5.2 capability ownership (dual-read during migration) -------
+    # ``cap-<slug>`` when the rule is owned by a Capability, ``None`` for a
+    # legacy rule that still resolves through ``sources[]``. The registry
+    # treats capability ownership as authoritative when present.
+    capability_id: Optional[str] = None
+
+    @field_validator("capability_id")
+    @classmethod
+    def _check_capability_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not isinstance(v, str) or not v:
+            raise ValueError("capability_id must be a non-empty string")
+        if not _CAPABILITY_ID_PATTERN.match(v):
+            raise ValueError(
+                f"capability_id must match ^cap-[a-z][a-z0-9-]{{1,47}}$, "
+                f"got {v!r}"
+            )
+        return v
 
     @field_validator("sources")
     @classmethod
@@ -340,6 +364,44 @@ class RuleMetadata(BaseModel):
         if not self.sources:
             return False
         return source in self.sources
+
+    def capability_owned(self) -> bool:
+        """Phase 5.2: does this rule carry an authoritative capability?"""
+        return bool(self.capability_id)
+
+    def matches_capability(self, capability_id: Optional[str]) -> bool:
+        """Phase 5.2 dual-read applicability.
+
+        Returns True when the rule should be considered for an event whose
+        **server-derived** capability is ``capability_id``:
+
+        * rule has no capability -> ``True`` (legacy rule; the caller uses
+          the Phase 4 ``sources[]`` string match, unchanged);
+        * rule has a capability, event has one -> the ids must be equal;
+          capability ownership wins over the legacy ``sources[]`` list;
+        * rule has a capability but the event carries none (an event
+          ingested outside the binding-aware ingress) -> ``True`` so the
+          caller can fall back to the string match instead of silently
+          dropping rules that used to fire. This is the "dual-read during
+          migration" half of master plan §19.
+        """
+        if not self.capability_id:
+            return True
+        if capability_id is None:
+            return True
+        return capability_id == self.capability_id
+
+    def capability_authoritative_for(
+        self, capability_id: Optional[str]
+    ) -> bool:
+        """True when capability ownership alone decides applicability.
+
+        Only when the rule is capability-owned **and** the event carries a
+        server-derived capability: in that case the legacy ``sources[]``
+        string filter must not be able to veto a rule whose owner is
+        already proven (or to admit a rule whose owner differs).
+        """
+        return bool(self.capability_id) and capability_id is not None
 
     def applies_to_event_type(self, event_type: str) -> bool:
         if not self.event_types:

@@ -40,6 +40,10 @@ from ..domain.errors import (
     ValidationError,
 )
 from .errors import CaseNotFoundError
+from ..persistence.human_ids import (
+    COUNTERS_COLLECTION,
+    HumanIdAllocator,
+)
 from .models import (
     Incident,
     IncidentEvidence,
@@ -121,6 +125,9 @@ INCIDENTS_VALIDATOR: Dict[str, Any] = {
                 "bsonType": "string",
                 "enum": [
                     "open",
+                    # Capability patch gap 1: analyst triage states.
+                    "acknowledged",
+                    "investigating",
                     "centralized_pending",
                     "centralized_failed",
                     "report_pending",
@@ -158,6 +165,23 @@ INCIDENTS_VALIDATOR: Dict[str, Any] = {
             # low/medium/high/very_high). Optional; "" = not composed.
             "severity": {"bsonType": "string", "maxLength": 32},
             "confidence": {"bsonType": "string", "maxLength": 32},
+            # Capability patch gap 2: allocator-assigned human id.
+            "human_id": {"bsonType": "string", "maxLength": 32},
+            # Capability patch gap 3: evidence-derived attribution.
+            "attribution": {
+                "bsonType": ["object", "null"],
+                "additionalProperties": False,
+                "properties": {
+                    "attacker": {"bsonType": "string", "maxLength": 256},
+                    "target": {"bsonType": "string", "maxLength": 256},
+                    "source_instance_id": {
+                        "bsonType": "string", "maxLength": 96,
+                    },
+                    "provenance": {"bsonType": "string", "maxLength": 512},
+                },
+            },
+            # Capability patch gap 4: append-only analyst notes.
+            "notes": {"bsonType": "array"},
             "created_by": {"bsonType": "string", "minLength": 1, "maxLength": 128},
             "created_at": {"bsonType": "date"},
             "updated_at": {"bsonType": "date"},
@@ -174,6 +198,23 @@ class IncidentRepository:
         self._db = db
         self._config = config
         self._collection: Collection = db[incident_collection_name(config)]
+        # Capability patch gap 2: creation-time human-id assignment.
+        # Real MongoDB -> atomic counter collection; any backend whose
+        # collection lacks find_one_and_update (the in-memory fakes)
+        # falls back to the process-local monotonic allocator with the
+        # same allocation contract.
+        counters = db[COUNTERS_COLLECTION]
+        if not hasattr(counters, "find_one_and_update"):
+            counters = None
+        self._human_ids = HumanIdAllocator(counters, "incident")
+
+    def _with_human_id(self, incident: Incident) -> Incident:
+        """Assign the persisted human id once, at first persistence."""
+        if incident.human_id:
+            return incident
+        return incident.model_copy(
+            update={"human_id": self._human_ids.allocate()},
+        )
 
     @property
     def collection(self) -> Collection:
@@ -252,6 +293,7 @@ class IncidentRepository:
                 internal_detail=f"got {type(incident).__name__}",
                 field="incident",
             )
+        incident = self._with_human_id(incident)
         doc = _incident_to_bson(incident)
         try:
             self._collection.insert_one(doc)
@@ -286,6 +328,9 @@ class IncidentRepository:
                 internal_detail=f"got {type(incident).__name__}",
                 field="incident",
             )
+        # Guarantee every persisted case carries its human id (gap 2),
+        # including legacy cases first touched by an upsert.
+        incident = self._with_human_id(incident)
         doc = _incident_to_bson(incident)
         try:
             self._collection.replace_one(

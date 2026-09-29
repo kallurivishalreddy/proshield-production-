@@ -39,6 +39,7 @@ from pymongo.errors import (
 from pydantic import ValidationError as PydanticValidationError
 
 from ..config import ProShieldConfig
+from ..capabilities.models import CAPABILITY_ID_RE
 from ..domain.errors import (
     PersistenceError,
     ValidationError,
@@ -217,6 +218,16 @@ MANAGED_RULES_VALIDATOR: Dict[str, Any] = {
                 },
                 "minItems": 0,
                 "maxItems": 16,
+            },
+            # Phase 5.2: authoritative capability ownership. ``null`` is the
+            # persisted form of "legacy rule, not yet bound" — the honest
+            # state required by freeze §38, so the property is optional and
+            # nullable rather than required.
+            "capability_id": {
+                "bsonType": ["string", "null"],
+                "minLength": 5,
+                "maxLength": 64,
+                "pattern": r"^cap-[a-z][a-z0-9-]{1,47}$",
             },
             "tags": {
                 "bsonType": "array",
@@ -577,6 +588,69 @@ class RuleRepository:
 
 
     # ---------------------------------------------------------------- delete
+    def set_capability_id_if_missing(
+        self, rule_id: str, version: int, capability_id: str
+    ) -> bool:
+        """Fill a **missing** capability owner on an existing rule row.
+
+        Returns ``True`` when a row was updated. This is a bounded,
+        non-destructive backfill used by the managed-rule seeding
+        reconciliation (2026-09-18 audit): a ``managed_rules`` row created
+        before the shipped library rules declared their capability owner keeps
+        ``capability_id: null`` forever, because seeding is insert-only. The
+        persisted catalogue then contradicts the live registry (the Rules page
+        truthfully reports "no capability owner" while the detector knows
+        ``cap-nginx``), which breaks the verifiability of capability ownership.
+
+        Safety rules:
+        * only a **missing / null** owner is filled — an owner that is already
+          present (operator-set or previously backfilled) is never overwritten;
+        * ``capability_id`` must be a non-empty string matching the capability
+          id contract, so a malformed value can never be persisted;
+        * the update is a single conditional ``update_one`` filtered on the
+          null/absent owner, so concurrent callers cannot race a value in.
+        """
+        if not isinstance(rule_id, str) or not rule_id:
+            raise ValidationError(
+                safe_message="invalid rule_id",
+                internal_detail=(
+                    f"rule_id must be a non-empty str, got {type(rule_id).__name__}"
+                ),
+            )
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise ValidationError(
+                safe_message="invalid version",
+                internal_detail=f"got {version!r}",
+            )
+        if not isinstance(capability_id, str) or not capability_id:
+            raise ValidationError(
+                safe_message="invalid capability_id",
+                internal_detail=(
+                    f"capability_id must be a non-empty str, got "
+                    f"{type(capability_id).__name__}"
+                ),
+            )
+        if not CAPABILITY_ID_RE.match(capability_id):
+            raise ValidationError(
+                safe_message="invalid capability_id",
+                internal_detail=f"capability_id={capability_id!r}",
+            )
+        try:
+            result = self._collection.update_one(
+                {
+                    "rule_id": rule_id,
+                    "version": version,
+                    "capability_id": None,
+                },
+                {"$set": {"capability_id": capability_id}},
+            )
+        except PyMongoError as exc:
+            raise RulePersistenceError(
+                safe_message="could not backfill the rule capability owner",
+                internal_detail=f"{type(exc).__name__}: {exc}",
+            ) from exc
+        return bool(getattr(result, "modified_count", 0))
+
     def soft_delete(
         self, rule_id: str, version: int
     ) -> None:

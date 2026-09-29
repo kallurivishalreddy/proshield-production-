@@ -55,6 +55,7 @@ def ensure_all_collections(db: Any, config: ProShieldConfig) -> Dict[str, Any]:
     from ..persistence.security_event_repository import (
         SecurityEventRepository,
     )
+    from ..capabilities.repository import CAPABILITIES_VALIDATOR, CapabilityRepository
     from ..reports.repository import REPORTS_VALIDATOR, ReportRepository
     from ..sources.repository import SOURCE_INSTANCES_VALIDATOR, SourceRepository
 
@@ -98,6 +99,11 @@ def ensure_all_collections(db: Any, config: ProShieldConfig) -> Dict[str, Any]:
             SourceRepository(db=db, config=config),
             SOURCE_INSTANCES_VALIDATOR,
         ),
+        (
+            "capabilities",
+            CapabilityRepository(db=db, config=config),
+            CAPABILITIES_VALIDATOR,
+        ),
     )
 
     results: Dict[str, Dict[str, Any]] = {}
@@ -109,6 +115,16 @@ def ensure_all_collections(db: Any, config: ProShieldConfig) -> Dict[str, Any]:
         if coll is None:
             coll = getattr(repo, "_collection", None)
         coll_name = coll.name if coll is not None else name
+        # 0. OWNER-52-04: race-tolerant collection creation. BOTH
+        #    deployment planes call this hook, and the shipped launcher
+        #    starts them together against the same database, so the
+        #    repositories' check-then-``create_collection`` pattern is not
+        #    atomic: the loser of the race used to abort the whole plane
+        #    with ``PersistenceError: could not create <x> collection``
+        #    (MongoDB ``NamespaceExists`` / "already exists, but with
+        #    different options"). Creating it here first makes the
+        #    repository call below a no-op on the winner's collection.
+        _ensure_collection(db, coll_name, validator)
         # 1. Collection-level setup (creation + validator).
         repo.ensure_schema()
         # 2. Re-assert the validator on an existing collection
@@ -140,8 +156,151 @@ def ensure_all_collections(db: Any, config: ProShieldConfig) -> Dict[str, Any]:
             type(exc).__name__,
         )
 
+    # Phase 5.2: the append-only source audit trail. Every binding /
+    # lifecycle / token / migration write appends here, so the collection
+    # must exist with its validator + indexes on a fresh deployment —
+    # otherwise the audit guarantee would depend on the first write path
+    # happening to create it.
+    try:
+        from ..sources.audit import SOURCE_AUDIT_COLLECTION
+
+        _audit_repo = SourceRepository(db=db, config=config)
+        _audit_repo.ensure_audit_schema()
+        audit_indexes = _audit_repo.ensure_audit_indexes()
+        # NB: deliberately NOT added to ``results``. The V2-P0 invariant
+        # asserted by the bootstrap audit is "every *entity* collection has
+        # a unique id index". An append-only audit trail has no such
+        # natural unique key (two identical-looking events at the same
+        # instant are both legitimate records); its uniqueness is the
+        # server-managed ``_id``. The Phase 5.1 ``capability_audit``
+        # collection is prepared the same way, outside the summary.
+        _log.info(
+            "bootstrap.audit_collection_ready collection=%s indexes=%s",
+            SOURCE_AUDIT_COLLECTION,
+            audit_indexes,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Loud, not silent: a deployment that cannot create its audit
+        # collection has lost the Phase 5.2 audit guarantee. The
+        # ``source_audit_collection`` health probe surfaces the same
+        # condition so it cannot hide in a log file.
+        _log.error(
+            "bootstrap.source_audit_unavailable error=%s: the append-only "
+            "source audit collection could not be prepared",
+            type(exc).__name__,
+        )
+
+    # Phase 5.1: idempotent built-in capability seeds. Seed-only;
+    # no legacy rewrite. Failures are LOUD (§18.25 "seed failure blocks
+    # boot"): a deployment must never start with a missing registry.
+    # (Finding 5.1-04: this block previously swallowed exceptions into a
+    # warning, deviating from the fail-loud contract.)
+    from ..capabilities.registry import CapabilityRegistry
+    from ..capabilities.repository import CapabilityRepository as _CapRepo
+    from ..capabilities.service import CapabilityService as _CapService
+
+    _cap_repo = _CapRepo(db=db, config=config)
+    _cap_service = _CapService(repository=_cap_repo, registry=CapabilityRegistry())
+    _cap_repo.ensure_audit_schema()
+    _cap_repo.ensure_audit_indexes()
+    _cap_service.reload_from_repository()
+    seed_summary = _cap_service.seed_builtins(actor="system")
+    _log.info("bootstrap.capabilities_seeded %s", seed_summary)
+
+    # Capability patch additions (gaps 2, 9, 12):
+    # * counters — the unique per-entity-kind human-id counters;
+    # * notifications — persisted analyst notification feed;
+    # * source_telemetry — per-source ingest counters.
+    # The ``counters`` collection is keyed on the native unique
+    # ``_id`` (one doc per entity kind) — MongoDB maintains that
+    # uniqueness automatically, so no extra index is created.
+    try:
+        from .telemetry import (
+            SOURCE_TELEMETRY_COLLECTION,
+            SourceTelemetryStore,
+        )
+
+        telemetry_store = SourceTelemetryStore(db=db, config=config)
+        telemetry_store.ensure_schema()
+        results[SOURCE_TELEMETRY_COLLECTION] = {
+            "validator": True,
+            "indexes": telemetry_store.ensure_indexes(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "bootstrap.capability_collections_skipped error=%s",
+            type(exc).__name__,
+        )
+    try:
+        from ..notifications import (
+            NOTIFICATIONS_COLLECTION,
+            NotificationRepository,
+        )
+
+        notif_repo = NotificationRepository(db=db, config=config)
+        notif_repo.ensure_schema()
+        results[NOTIFICATIONS_COLLECTION] = {
+            "validator": True,
+            "indexes": notif_repo.ensure_indexes(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "bootstrap.notifications_skipped error=%s",
+            type(exc).__name__,
+        )
+
     _log.info("bootstrap.complete collections=%d", len(results))
     return results
+
+
+def _ensure_collection(db: Any, coll_name: str, validator: Dict[str, Any]) -> bool:
+    """Create ``coll_name`` with its validator if it is not there yet.
+
+    OWNER-52-04 (Phase 5.2 baseline). Both deployment planes call this
+    bootstrap hook, and the shipped launcher starts them within the same
+    second against the same database. The repositories' existence check
+    followed by ``create_collection`` is therefore a check-then-act race:
+    the loser is rejected by MongoDB with ``NamespaceExists`` (code 48) or
+    "namespace ... already exists, but with different options" (code 85),
+    which the repository translates into a fatal ``PersistenceError`` and
+    the plane refuses to start.
+
+    Losing that race is not a failure: the caller re-asserts the
+    documented validator with ``collMod`` immediately afterwards, so both
+    planes converge on the documented shape. This helper creates the
+    collection when possible and tolerates a concurrent creator. Any
+    other failure still propagates (the bootstrap contract is
+    fail-loud).
+
+    Returns ``True`` only when this call created the collection.
+    """
+    creator = getattr(db, "create_collection", None)
+    if creator is None:
+        # Backends without an explicit create (in-memory dev doubles)
+        # materialise collections lazily; nothing to prepare here.
+        return False
+    try:
+        if coll_name in db.list_collection_names():
+            return False
+    except Exception:  # noqa: BLE001 - capability probe only
+        pass
+    try:
+        creator(coll_name, validator=validator)
+        return True
+    except Exception as exc:  # noqa: BLE001 - tolerance decided below
+        try:
+            exists_now = coll_name in db.list_collection_names()
+        except Exception:  # noqa: BLE001
+            exists_now = False
+        if exists_now:
+            _log.info(
+                "bootstrap.collection_created_concurrently collection=%s "
+                "error=%s",
+                coll_name,
+                type(exc).__name__,
+            )
+            return False
+        raise
 
 
 def _assert_validator(db: Any, coll_name: str, validator: Dict[str, Any]) -> bool:

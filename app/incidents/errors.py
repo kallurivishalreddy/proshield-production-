@@ -77,10 +77,24 @@ class InvalidIncidentInputError(ValidationError):
     """
 
 
+class CaseStateConflictError(IncidentError):
+    """A lifecycle transition was requested that the case's
+    current state does not permit (capability patch gap 1).
+
+    The wire returns ``409`` so the caller can distinguish
+    "invalid input" (400) from "valid request, stale state"
+    (409). The case is left untouched.
+    """
+
+    code = "case_state_conflict"
+    http_status = 409
+
+
 __all__ = [
     "CaseAccessDeniedError",
     "CaseEvidenceError",
     "CaseNotFoundError",
+    "CaseStateConflictError",
     "IncidentError",
     "InvalidIncidentInputError",
 ]

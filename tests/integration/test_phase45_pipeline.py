@@ -155,7 +155,11 @@ def test_phase45_full_pipeline_correlates_brute_force(
     corr_repo.ensure_schema()
     corr_repo.ensure_indexes()
     persisted = corr_repo.create(corr)
-    assert persisted is corr
+    # Capability patch gaps 2+6: persistence composes the documented
+    # confidence band and assigns the persisted human id.
+    assert persisted.correlation_id == corr.correlation_id
+    assert persisted.human_id == "CORR-000001"
+    assert persisted.confidence in {"low", "medium", "high", "very_high"}
     fetched = corr_repo.get_by_correlation_id(corr.correlation_id)
     assert fetched is not None
     assert fetched.correlation_id == corr.correlation_id

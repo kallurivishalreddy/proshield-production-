@@ -5,7 +5,7 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from pydantic import ValidationError as PydanticValidationError
 
@@ -19,18 +19,26 @@ from ..domain.security_event import SecurityEvent
 from .errors import (
     CaseAccessDeniedError,
     CaseEvidenceError,
+    CaseNotFoundError,
+    CaseStateConflictError,
     InvalidIncidentInputError,
 )
 from .models import (
+    CASE_STATE_ACKNOWLEDGED,
     CASE_STATE_CENTRALIZED_FAILED,
     CASE_STATE_CENTRALIZED_PENDING,
     CASE_STATE_CLOSED,
+    CASE_STATE_INVESTIGATING,
     CASE_STATE_OPEN,
+    CaseAttribution,
+    CaseNote,
     Incident,
     IncidentEvidence,
     IncidentLifecycleState,
     LifecycleTransition,
     MAX_CASE_LIFECYCLE_HISTORY,
+    MAX_CASE_NOTE_LEN,
+    MAX_CASE_NOTES,
     MAX_CASE_TITLE_LEN,
 )
 from .repository import IncidentRepository
@@ -59,12 +67,49 @@ class IncidentService:
         *,
         correlation_engine: Optional[CorrelationEngine] = None,
         correlation_persister: Optional[Any] = None,
+        notification_sink: Optional[Any] = None,
     ) -> None:
         if not isinstance(repository, IncidentRepository):
             raise ValueError("repository must be an IncidentRepository")
         self._repository = repository
         self._correlation_engine = correlation_engine
         self._correlation_persister = correlation_persister
+        # Capability patch gap 12: an optional sink the service calls
+        # after real state changes. The sink is injected by the
+        # deployment wiring (notifications package); the service stays
+        # decoupled from the notification persistence and NEVER fails
+        # the business operation because a notification could not be
+        # recorded (observable via a logged warning instead).
+        self._notification_sink = notification_sink
+
+    def _emit_notification(
+        self,
+        *,
+        kind: str,
+        case: Incident,
+        actor_subject_id: str,
+        detail: str,
+    ) -> None:
+        if self._notification_sink is None:
+            return
+        try:
+            self._notification_sink(
+                kind=str(kind),
+                incident_id=case.incident_id,
+                human_id=case.human_id or "",
+                title=case.title,
+                actor_subject_id=str(actor_subject_id),
+                detail=str(detail or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail the op
+            _log.warning(
+                "incident.notification_sink_failed",
+                extra={
+                    "incident_id": case.incident_id,
+                    "kind": str(kind),
+                    "error_type": type(exc).__name__,
+                },
+            )
 
     @property
     def repository(self) -> IncidentRepository:
@@ -184,7 +229,19 @@ class IncidentService:
         timeline=None,
         severity=None,
         incident_id: Optional[str] = None,
+        extra_event_ids: Sequence[str] = (),
+        extra_detection_ids: Sequence[str] = (),
     ) -> Incident:
+        """Create a case from resolved evidence.
+
+        ``extra_event_ids`` / ``extra_detection_ids`` are *id-only* evidence
+        references (Batch 1/2 T28): the correlation row is a cluster's
+        authoritative evidence catalogue and may reference events/detections
+        whose full model objects the caller does not hold (they were processed
+        by an earlier request / process). They are merged, de-duplicated and
+        order-preserving, so the newly opened case carries the complete
+        cluster evidence instead of only the triggering member.
+        """
         if not isinstance(identity, Identity):
             raise InvalidIncidentInputError(
                 safe_message="identity required",
@@ -226,8 +283,13 @@ class IncidentService:
                     internal_detail=f"got {type(c).__name__}",
                     field="correlations",
                 )
-        event_ids = tuple(e.event_id for e in events_list)
-        detection_ids = tuple(d.detection_id for d in detections_list)
+        event_ids = _dedup_preserving_order(
+            [e.event_id for e in events_list] + list(extra_event_ids or ())
+        )
+        detection_ids = _dedup_preserving_order(
+            [d.detection_id for d in detections_list]
+            + list(extra_detection_ids or ())
+        )
         correlation_ids = tuple(c.correlation_id for c in correlations_list)
         rule_refs = _dedup_rule_refs(detections_list)
         evidence = IncidentEvidence(
@@ -258,6 +320,12 @@ class IncidentService:
         composed_severity, composed_confidence = _compose_case_severity(
             detections_list, correlations_list, {}
         )
+        # Capability patch gap 3: derive the analyst-facing attribution
+        # from the case's own evidence (correlation key parts + event
+        # provenance). Never invented; None when underivable.
+        attribution = _compose_case_attribution(
+            events_list, detections_list, correlations_list,
+        )
         case = Incident(
             incident_id=incident_id,
             title=str(title or "")[:MAX_CASE_TITLE_LEN],
@@ -267,6 +335,7 @@ class IncidentService:
             rule_references=rule_refs,
             severity=composed_severity or "",
             confidence=composed_confidence or "",
+            attribution=attribution,
             report_references=(),
             centralized_correlation_ids=(),
             centralized_reasoning="",
@@ -276,7 +345,15 @@ class IncidentService:
             created_at=now,
             updated_at=now,
         )
-        return self._repository.create(case)
+        created = self._repository.create(case)
+        self._emit_notification(
+            kind="case.created",
+            case=created,
+            actor_subject_id=identity.subject_id,
+            detail=f"case created ({len(event_ids)} event(s), "
+                   f"{len(detection_ids)} detection(s))",
+        )
+        return created
 
     def create_case_for_correlation(
         self,
@@ -316,6 +393,23 @@ class IncidentService:
         case_id = _case_id_for_correlation(correlation)
         existing = self._repository.get_by_id(case_id)
         if existing is not None:
+            # Phase 5.2 owner patch OWNER-52-01 — ownership gate.
+            # The deterministic case id means this call is a *reuse* of
+            # an already-cased cluster (every normal cluster is
+            # auto-cased by the live pipeline), not a creation. The
+            # caller therefore has to be authorized to read what it
+            # receives, exactly as :meth:`get_case` demands. Without this
+            # gate the wire operation returned the complete body of a
+            # case the caller cannot read (title/summary/evidence ids,
+            # an alternate-route bypass of the case ownership model) and
+            # merged evidence into it. The gate runs BEFORE any
+            # mutation, so an unauthorized caller can neither read nor
+            # change the case.
+            # The live pipeline is the only internal caller and carries
+            # an explicit ``case:read:any`` system grant (see
+            # :class:`app.pipeline.service.LivePipeline`), so the V2-02
+            # evidence-accumulation behaviour is unchanged.
+            self._authorize_case_access(identity, existing)
             # V2-02 fix: the case is idempotent on the cluster key, but
             # its *evidence* must accumulate as the cluster grows. The
             # previous implementation returned the existing case
@@ -362,6 +456,18 @@ class IncidentService:
             detections=detections,
             correlations=[correlation],
             incident_id=case_id,
+            # Batch 1/2 T28 fix: the correlation row is the cluster's
+            # authoritative evidence catalogue. The CREATE path previously
+            # captured only the triggering event/detection, so a
+            # threshold-exact cluster (4 events → 1 correlation row on the
+            # 4th event) opened a case holding 1 event + 1 detection while
+            # the correlation held the full set. Both paths now compose the
+            # identical evidence set (the reuse path already absorbed the
+            # catalogue via ``_merge_case_evidence``).
+            extra_event_ids=tuple(getattr(correlation, "event_ids", ())),
+            extra_detection_ids=tuple(
+                getattr(correlation, "detection_ids", ())
+            ),
         )
 
     def request_centralized_analysis(
@@ -578,7 +684,183 @@ class IncidentService:
             ),
             "updated_at": now,
         })
-        return self._repository.upsert(closed)
+        persisted = self._repository.upsert(closed)
+        self._emit_notification(
+            kind="case.closed",
+            case=persisted,
+            actor_subject_id=identity.subject_id,
+            detail=str(reason or "case closed")[:256],
+        )
+        return persisted
+
+    # ------------------------------------------------------------------
+    # Capability patch gap 1: analyst triage transitions.
+    #
+    # Documented transition matrix (closed set):
+    #
+    #   open ----------> acknowledged    (case.acknowledge)
+    #   open ----------> investigating   (case.investigate)
+    #   acknowledged --> investigating   (case.investigate)
+    #   {open, acknowledged, investigating} --> closed (case.close)
+    #
+    # Everything else is rejected with a 409 CaseStateConflictError;
+    # the case is left untouched and the rejection is observable.
+    # A repeated same-state request is a conflict, NOT a silent
+    # success, so a duplicated click can never be mistaken for a
+    # state change that did not happen.
+    # ------------------------------------------------------------------
+
+    _TRIAGE_TRANSITIONS: Dict[str, set] = {
+        CASE_STATE_ACKNOWLEDGED: {CASE_STATE_OPEN},
+        CASE_STATE_INVESTIGATING: {CASE_STATE_OPEN, CASE_STATE_ACKNOWLEDGED},
+    }
+
+    def acknowledge_case(
+        self, identity, incident_id, reason="",
+    ) -> Incident:
+        """``open -> acknowledged`` (gap 1)."""
+        return self._transition_triage(
+            identity=identity,
+            incident_id=incident_id,
+            to_state_value=CASE_STATE_ACKNOWLEDGED,
+            verb="acknowledge",
+            reason=str(reason or "case acknowledged"),
+        )
+
+    def investigate_case(
+        self, identity, incident_id, reason="",
+    ) -> Incident:
+        """``open|acknowledged -> investigating`` (gap 1)."""
+        return self._transition_triage(
+            identity=identity,
+            incident_id=incident_id,
+            to_state_value=CASE_STATE_INVESTIGATING,
+            verb="investigate",
+            reason=str(reason or "investigation started"),
+        )
+
+    def _transition_triage(
+        self,
+        *,
+        identity,
+        incident_id,
+        to_state_value: str,
+        verb: str,
+        reason: str,
+    ) -> Incident:
+        if not isinstance(identity, Identity):
+            raise InvalidIncidentInputError(
+                safe_message="identity required",
+                internal_detail=f"got {type(identity).__name__}",
+                field="identity",
+            )
+        case = self._repository.get_by_id_or_raise(incident_id)
+        self._authorize_case_access(identity, case)
+        current = case.state.value
+        allowed_from = self._TRIAGE_TRANSITIONS.get(to_state_value, set())
+        if case.state is IncidentLifecycleState.CLOSED:
+            raise CaseStateConflictError(
+                safe_message=(
+                    f"cannot {verb} a closed case"
+                ),
+                internal_detail=(
+                    f"incident_id={incident_id} state={current!r}"
+                ),
+            )
+        if current == to_state_value:
+            raise CaseStateConflictError(
+                safe_message=(
+                    f"case is already in state {to_state_value!r}"
+                ),
+                internal_detail=(
+                    f"incident_id={incident_id} repeated {verb}"
+                ),
+            )
+        if current not in allowed_from:
+            raise CaseStateConflictError(
+                safe_message=(
+                    f"cannot {verb} a case in state {current!r}"
+                ),
+                internal_detail=(
+                    f"incident_id={incident_id} "
+                    f"{current!r} -> {to_state_value!r} not allowed"
+                ),
+            )
+        now = datetime.now(timezone.utc)
+        transition = LifecycleTransition(
+            from_state=current,
+            to_state=to_state_value,
+            actor_subject_id=identity.subject_id,
+            actor_role=identity.role,
+            reason=str(reason)[:2048],
+            transitioned_at=now,
+        )
+        updated = case.model_copy(update={
+            "state": IncidentLifecycleState(to_state_value),
+            "lifecycle_history": _append_transition(
+                case.lifecycle_history, transition,
+            ),
+            "updated_at": now,
+        })
+        persisted = self._repository.upsert(updated)
+        self._emit_notification(
+            kind=f"case.{verb}d" if verb == "acknowledge" else "case.investigating",
+            case=persisted,
+            actor_subject_id=identity.subject_id,
+            detail=str(reason)[:256],
+        )
+        return persisted
+
+    # ------------------------------------------------------------------
+    # Capability patch gap 4: append-only analyst notes.
+    # ------------------------------------------------------------------
+
+    def add_note(
+        self, identity, incident_id, body,
+    ) -> Incident:
+        """Append an immutable analyst note; returns the updated case."""
+        if not isinstance(identity, Identity):
+            raise InvalidIncidentInputError(
+                safe_message="identity required",
+                internal_detail=f"got {type(identity).__name__}",
+                field="identity",
+            )
+        if not isinstance(body, str) or not body.strip():
+            raise InvalidIncidentInputError(
+                safe_message="note body required",
+                internal_detail="empty note body",
+                field="body",
+            )
+        case = self._repository.get_by_id_or_raise(incident_id)
+        self._authorize_case_access(identity, case)
+        if len(case.notes) >= MAX_CASE_NOTES:
+            raise CaseStateConflictError(
+                safe_message="case note limit reached",
+                internal_detail=(
+                    f"incident_id={incident_id} "
+                    f"notes={len(case.notes)}"
+                ),
+            )
+        now = datetime.now(timezone.utc)
+        note = CaseNote(
+            note_id=_make_note_id(now, identity.subject_id),
+            author_subject_id=identity.subject_id,
+            author_role=str(identity.role),
+            body=body.strip()[:MAX_CASE_NOTE_LEN],
+            created_at=now,
+        )
+        updated = case.model_copy(update={
+            "notes": tuple(case.notes) + (note,),
+            "updated_at": now,
+        })
+        persisted = self._repository.upsert(updated)
+        self._emit_notification(
+            kind="case.note_added",
+            case=persisted,
+            actor_subject_id=identity.subject_id,
+            detail="analyst note appended",
+        )
+        return persisted
 
 
 
@@ -810,6 +1092,90 @@ def _case_id_for_correlation(correlation: Correlation) -> str:
     hex_str = f"{uuid_int:032x}"
     return (
         "case-"
+        f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-"
+        f"{hex_str[16:20]}-{hex_str[20:32]}"
+    )
+
+
+def _compose_case_attribution(
+    events: Sequence[SecurityEvent],
+    detections: Sequence[Detection],
+    correlations: Sequence[Correlation],
+) -> Optional[CaseAttribution]:
+    """Derive the analyst-facing attribution from the case's evidence.
+
+    Deterministic and evidence-only (capability patch gap 3):
+
+    * ``attacker``  - the first correlation key part (the patterns
+      group by ``source_ip`` first), with the pattern id recorded as
+      provenance.
+    * ``target``    - the second correlation key part (the grouped
+      endpoint), same provenance rule.
+    * ``source_instance_id`` - the first non-empty event provenance
+      pointer, falling back to the first detection provenance pointer.
+    * every field records HOW it was derived in ``provenance``.
+
+    A field that cannot be derived stays empty (wire ``null``); when
+    nothing at all can be derived the attribution itself is ``None``.
+    No external intel, no heuristic enrichment, no invention.
+    """
+    attacker = ""
+    target = ""
+    provenance_parts: List[str] = []
+    for c in correlations:
+        parts = list(getattr(getattr(c, "key", None), "parts", ()) or ())
+        if parts and not attacker:
+            attacker = str(parts[0])[:256]
+            provenance_parts.append(
+                f"attacker=correlation key part 1 ({c.pattern_id})"
+            )
+        if len(parts) > 1 and not target:
+            target = str(parts[1])[:256]
+            provenance_parts.append(
+                f"target=correlation key part 2 ({c.pattern_id})"
+            )
+        if attacker and target:
+            break
+    source_instance_id = ""
+    for ev in events:
+        sid = getattr(getattr(ev, "provenance", None),
+                      "source_instance_id", None)
+        if sid:
+            source_instance_id = str(sid)[:96]
+            provenance_parts.append("source=event provenance")
+            break
+    if not source_instance_id:
+        for d in detections:
+            sid = getattr(d, "source_instance_id", "")
+            if sid:
+                source_instance_id = str(sid)[:96]
+                provenance_parts.append("source=detection provenance")
+                break
+    if not (attacker or target or source_instance_id):
+        return None
+    return CaseAttribution(
+        attacker=attacker,
+        target=target,
+        source_instance_id=source_instance_id,
+        provenance="; ".join(provenance_parts)[:512],
+    )
+
+
+def _make_note_id(now: datetime, author: str) -> str:
+    """Deterministic ``note-<uuidv7-shape>`` id for a case note."""
+    body = f"{author}|{now.timestamp():.6f}".encode("utf-8")
+    digest = hashlib.sha256(body).digest()
+    ts_ms = int(now.timestamp() * 1000) & ((1 << 48) - 1)
+    rand_a = int.from_bytes(digest[0:2], "big") & 0x0FFF
+    rand_b_hi = (int.from_bytes(digest[2:4], "big") & 0x3FFF) | 0x8000
+    rand_b_lo = int.from_bytes(digest[4:10], "big")
+    uuid_int = (
+        (ts_ms << 80) | (0x7 << 76) | (rand_a << 64)
+        | (rand_b_hi << 48) | rand_b_lo
+    )
+    hex_str = f"{uuid_int:032x}"
+    return (
+        "note-"
         f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-"
         f"{hex_str[16:20]}-{hex_str[20:32]}"
     )

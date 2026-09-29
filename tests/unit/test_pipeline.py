@@ -161,7 +161,20 @@ class TestRun:
         )
         result = pipeline.run(ev, now=FIXED_NOW)
         assert len(result.persisted_detections) == 1
-        detection_repository.create.assert_called_once_with(det)
+        # Capability patch gap 5: the pipeline composes the documented
+        # severity band (SeverityEngine) and the source provenance
+        # pointer before persistence, so the persisted detection is an
+        # ENRICHED copy of the engine output.
+        persisted = result.persisted_detections[0]
+        assert persisted.detection_id == det.detection_id
+        from app.severity.models import SeverityBand
+
+        assert persisted.severity in {b.value for b in SeverityBand}
+        assert detection_repository.create.call_count == 1
+        assert (
+            detection_repository.create.call_args[0][0].detection_id
+            == det.detection_id
+        )
 
     def test_idempotent_detection_persistence(
         self, pipeline, ingestion_service, detection_repository

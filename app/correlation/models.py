@@ -77,6 +77,7 @@ __all__ = [
     "CorrelationTrigger",
     "CentralizedCorrelationResult",
     "EventId",
+    "MAX_CORRELATION_CAPABILITIES",
     "MAX_CORRELATION_REASONING_LEN",
 ]
 
@@ -293,6 +294,11 @@ MAX_CORRELATION_REASONING_LEN = 2048
 MAX_CORRELATION_DETECTIONS = 256
 MAX_CORRELATION_EVENTS = 256
 MAX_CORRELATION_EXTRA = 16
+# Phase 5.2 (§8/§12): bound on the derived ``capability_ids`` tuple. A
+# correlation groups detections that all share one capability in practice;
+# the bound exists so a future multi-capability pattern cannot store an
+# unbounded list, mirroring the ``MAX_CORRELATION_EXTRA`` D-4 fix.
+MAX_CORRELATION_CAPABILITIES = 16
 
 
 class Correlation(BaseModel):
@@ -342,6 +348,39 @@ class Correlation(BaseModel):
         Tuple[Tuple[str, Any], ...],
         Field(max_length=MAX_CORRELATION_EXTRA),
     ] = ()
+    # Capability patch gap 6: the documented ConfidenceBand composed
+    # by the SeverityEngine at persistence time. Empty = not composed
+    # (the wire renders null; the UI renders "—" — never a fabricated
+    # number). The engine itself still does NOT assign confidence:
+    # composition happens at the documented severity layer.
+    confidence: Annotated[str, StringConstraints(max_length=32)] = ""
+    # Capability patch gap 2: allocator-assigned human id
+    # (``CORR-000001``), assigned at persistence time. Not part of the
+    # deterministic ``correlation_id`` derivation.
+    human_id: Annotated[str, StringConstraints(max_length=32)] = ""
+    # Phase 5.2 (§8, §12): the capabilities that owned the member
+    # detections, derived from those detections (never from the pattern
+    # or the request). Stored sorted + de-duplicated so the value is
+    # deterministic and replay-stable. An empty tuple means no member
+    # detection carried a derived capability (pre-5.2 evidence, or an
+    # event ingested outside the binding-aware ingress) — the wire
+    # renders ``null`` rather than inventing an owner. An empty *item*
+    # is rejected outright (the item pattern requires a well-formed
+    # ``cap-*`` id); the producer filters blanks before constructing.
+    # Like ``human_id`` this is NOT part of the ``correlation_id``
+    # derivation.
+    capability_ids: Annotated[
+        Tuple[
+            Annotated[
+                str,
+                StringConstraints(
+                    max_length=64, pattern=r"^cap-[a-z][a-z0-9-]{1,47}$"
+                ),
+            ],
+            ...,
+        ],
+        Field(max_length=MAX_CORRELATION_CAPABILITIES),
+    ] = ()
 
     @field_validator("trigger")
     @classmethod
@@ -376,6 +415,25 @@ class Correlation(BaseModel):
             )
         return v
 
+    @field_validator("capability_ids")
+    @classmethod
+    def _normalise_capability_ids(
+        cls, v: Tuple[str, ...]
+    ) -> Tuple[str, ...]:
+        """De-duplicate and sort so the derived list is deterministic.
+
+        ``capability_ids`` is *derived* from the member detections; sorting
+        keeps the stored value replay-stable regardless of detection order.
+        The producer already drops blanks, so an empty item never reaches
+        here in practice; the comprehension is defence in depth.
+        """
+        if len(v) > MAX_CORRELATION_CAPABILITIES:
+            raise ValueError(
+                "too many capability_ids "
+                f"({len(v)} > {MAX_CORRELATION_CAPABILITIES})"
+            )
+        return tuple(sorted({c for c in v if c}))
+
     @field_validator("window_end")
     @classmethod
     def _window_end_after_start(cls, v: datetime, info) -> datetime:
@@ -398,6 +456,9 @@ class Correlation(BaseModel):
             "window_end": self.window_end.isoformat(),
             "count": self.count,
             "reasoning": self.reasoning,
+            "confidence": self.confidence or None,
+            "human_id": self.human_id or None,
+            "capability_ids": list(self.capability_ids),
             "correlated_at": self.correlated_at.isoformat(),
             "extra": dict(self.extra),
         }

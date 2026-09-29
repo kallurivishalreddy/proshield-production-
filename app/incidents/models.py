@@ -21,6 +21,10 @@ The lifecycle states are documented in the package
 ``__init__``. The closed set is:
 
 * open - initial state.
+* acknowledged - an analyst acknowledged the case
+  (triage recorded; capability patch gap 1).
+* investigating - an analyst is actively
+  investigating the case (gap 1).
 * centralized_pending - an analyst requested
   centralized analysis.
 * centralized_failed - the centralized correlation
@@ -91,6 +95,8 @@ class IncidentLifecycleState(str, Enum):
     """Closed-set case lifecycle."""
 
     OPEN = "open"
+    ACKNOWLEDGED = "acknowledged"
+    INVESTIGATING = "investigating"
     CENTRALIZED_PENDING = "centralized_pending"
     CENTRALIZED_FAILED = "centralized_failed"
     REPORT_PENDING = "report_pending"
@@ -99,6 +105,8 @@ class IncidentLifecycleState(str, Enum):
 
 # Module-level aliases matching the documented vocabulary.
 CASE_STATE_OPEN = IncidentLifecycleState.OPEN.value
+CASE_STATE_ACKNOWLEDGED = IncidentLifecycleState.ACKNOWLEDGED.value
+CASE_STATE_INVESTIGATING = IncidentLifecycleState.INVESTIGATING.value
 CASE_STATE_CENTRALIZED_PENDING = (
     IncidentLifecycleState.CENTRALIZED_PENDING.value
 )
@@ -209,6 +217,91 @@ class LifecycleTransition(BaseModel):
         }
 
 
+# ----------------------------------------------------------------- notes
+MAX_CASE_NOTE_LEN = 4096
+MAX_CASE_NOTES = 256
+CASE_NOTE_ID_PREFIX = "note"
+
+
+class CaseNote(BaseModel):
+    """One immutable, append-only analyst note on a case.
+
+    A note is authored evidence of the investigation: it records
+    WHO wrote it (subject + role), WHEN (UTC), and WHAT (a bounded
+    body). Notes are embedded on the case document, are append-only
+    (never edited or removed), and are scoped to exactly one case by
+    construction (no cross-case leakage is possible).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    note_id: Annotated[
+        str,
+        StringConstraints(
+            min_length=5,
+            max_length=64,
+            pattern=r"^note-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
+                    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        ),
+    ]
+    author_subject_id: Annotated[
+        str, StringConstraints(min_length=1, max_length=128)
+    ]
+    author_role: Annotated[
+        str, StringConstraints(min_length=1, max_length=32)
+    ]
+    body: Annotated[
+        str,
+        StringConstraints(min_length=1, max_length=MAX_CASE_NOTE_LEN),
+    ]
+    created_at: datetime
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "note_id": self.note_id,
+            "author_subject_id": self.author_subject_id,
+            "author_role": self.author_role,
+            "body": self.body,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+# ----------------------------------------------------------------- attribution
+class CaseAttribution(BaseModel):
+    """Analyst-facing case attribution (capability patch gap 3).
+
+    Values are **derived, never invented**: they are composed once
+    at case assembly from the case's own evidence (correlation key
+    parts and event provenance) and each field records how it was
+    derived via ``provenance``. A field that cannot be derived is
+    the empty string — the wire renders ``null`` and the UI renders
+    "not attributed". No heuristic enrichment, no external intel.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    attacker: Annotated[
+        str, StringConstraints(max_length=256)
+    ] = ""
+    target: Annotated[
+        str, StringConstraints(max_length=256)
+    ] = ""
+    source_instance_id: Annotated[
+        str, StringConstraints(max_length=96)
+    ] = ""
+    provenance: Annotated[
+        str, StringConstraints(max_length=512)
+    ] = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "attacker": self.attacker or None,
+            "target": self.target or None,
+            "source_instance_id": self.source_instance_id or None,
+            "provenance": self.provenance or None,
+        }
+
+
 class Incident(BaseModel):
     """The frozen, BSON-safe, evidence-referencing case.
 
@@ -229,7 +322,10 @@ class Incident(BaseModel):
       analyst explicitly requests it; see Section 3 of the
       Phase 4.8 task),
     * the audit metadata (created_by / created_at /
-      updated_at).
+      updated_at),
+    * the analyst-facing ``human_id`` (``CASE-000001``, gap 2),
+    * the append-only analyst :class:`CaseNote` list (gap 4),
+    * the evidence-derived :class:`CaseAttribution` (gap 3).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -281,6 +377,18 @@ class Incident(BaseModel):
     confidence: Annotated[
         str, StringConstraints(min_length=0, max_length=32)
     ] = ""
+    # Capability patch gap 2: the persisted, allocator-assigned
+    # human-readable id (``CASE-000001``). Empty for entities created
+    # before the allocator existed; the wire renders null.
+    human_id: Annotated[
+        str,
+        StringConstraints(min_length=0, max_length=32),
+    ] = ""
+    # Capability patch gap 3: evidence-derived attribution (None when
+    # it could not be derived — never fabricated).
+    attribution: Optional[CaseAttribution] = None
+    # Capability patch gap 4: append-only analyst notes.
+    notes: Tuple[CaseNote, ...] = ()
     created_by: Annotated[
         str, StringConstraints(min_length=1, max_length=128)
     ]
@@ -290,12 +398,17 @@ class Incident(BaseModel):
     def to_dict(self) -> Dict[str, Any]:
         return {
             "incident_id": self.incident_id,
+            "human_id": self.human_id or None,
             "title": self.title,
             "summary": self.summary,
             "state": self.state.value,
             "evidence": self.evidence.to_dict(),
             "severity": self.severity or None,
             "confidence": self.confidence or None,
+            "attribution": (
+                self.attribution.to_dict() if self.attribution else None
+            ),
+            "notes": [n.to_dict() for n in self.notes],
             "rule_references": [
                 {"rule_id": rid, "rule_version": ver}
                 for rid, ver in self.rule_references
@@ -317,11 +430,15 @@ class Incident(BaseModel):
 
 
 __all__ = [
+    "CASE_STATE_ACKNOWLEDGED",
     "CASE_STATE_CENTRALIZED_FAILED",
     "CASE_STATE_CENTRALIZED_PENDING",
     "CASE_STATE_CLOSED",
+    "CASE_STATE_INVESTIGATING",
     "CASE_STATE_OPEN",
     "CASE_STATE_REPORT_PENDING",
+    "CaseAttribution",
+    "CaseNote",
     "Incident",
     "IncidentEvidence",
     "IncidentId",

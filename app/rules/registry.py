@@ -31,7 +31,10 @@ import threading
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from ..domain.errors import DomainError
-from ..domain.security_event import SecurityEvent
+from ..domain.security_event import (
+    SecurityEvent,
+    capability_id_of_event,
+)
 from .rule import Rule
 from .types import (
     RuleCategory,
@@ -240,13 +243,27 @@ class RuleRegistry:
         return [r for r in self.list_all() if r.metadata.is_evaluable()]
 
     def list_for_event(
-        self, source: str, event_type: str
+        self,
+        source: str,
+        event_type: str,
+        capability_id: Optional[str] = None,
     ) -> List[Rule]:
         """Return evaluable rules whose applicability covers the given
-        ``(source, event_type)``.
+        ``(source, event_type)`` and — Phase 5.2 — the server-derived
+        ``capability_id``.
 
         This is the **hot path** of the detection engine. The result
         is sorted by ``(rule_id, version)`` for determinism.
+
+        Phase 5.2 resolution order (master plan §19):
+        * a rule that carries ``capability_id`` and an event that carries a
+          server-derived capability are compared on capability alone —
+          capability ownership is authoritative;
+        * a rule with no capability behaves exactly as in Phase 4 (the
+          legacy ``sources[]`` string match), so an un-migrated rule
+          cannot change behaviour;
+        * a capability-owned rule evaluated against an un-stamped event
+          falls back to the string match (dual-read during migration).
         """
         if not isinstance(source, str) or not source:
             return []
@@ -257,8 +274,11 @@ class RuleRegistry:
             meta = r.metadata
             if not meta.is_evaluable():
                 continue
-            if not meta.applies_to_source(source):
+            if not meta.matches_capability(capability_id):
                 continue
+            if not meta.capability_authoritative_for(capability_id):
+                if not meta.applies_to_source(source):
+                    continue
             if not meta.applies_to_event_type(event_type):
                 continue
             out.append(r)
@@ -270,8 +290,17 @@ class RuleRegistry:
         This is the documented "rule selection" step (Section 12):
         ``SecurityEvent -> identify source -> identify event type ->
         select applicable rules -> run relevant rules``.
+
+        Phase 5.2: the event's capability is read from the **provenance**
+        the ingress boundary stamped. It is derived metadata, never a
+        caller-supplied field, so a rule's capability ownership can be
+        enforced against a value the source itself cannot forge.
         """
-        return self.list_for_event(event.source, event.event_type)
+        return self.list_for_event(
+            event.source,
+            event.event_type,
+            capability_id_of_event(event),
+        )
 
     def is_empty(self) -> bool:
         with self._lock:

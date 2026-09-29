@@ -66,6 +66,7 @@ import uvicorn  # type: ignore
 from app.config import ProShieldConfig
 from app.ingestion.service import SecurityEventIngestionService
 from app.persistence.security_event_repository import SecurityEventRepository
+from app.persistence.telemetry import SourceTelemetryStore
 from app.sources.ingress import (
     OP_HEALTH,
     OP_INGEST,
@@ -269,12 +270,17 @@ def _build_mongo_ingress(config: ProShieldConfig) -> _IngressBundle:
     ingestion = SecurityEventIngestionService(
         SecurityEventRepository(db=db, config=config), config,
     )
+    # Capability patch gap 9: per-source ingest telemetry, maintained
+    # at THIS boundary and persisted for the analyst plane.
+    telemetry = SourceTelemetryStore(db=db, config=config)
+    telemetry.ensure_ready()
     ingress = InboundIngressProxy(
         config=config,
         registry=registry,
         token_verifier=verifier,
         ingestion_service=ingestion,
         authoritative_source_resolver=lambda sid: repo.get(sid),
+        telemetry_recorder=telemetry,
     )
     pipeline = _build_ingress_pipeline(config, db, ingestion)
     return _IngressBundle(
@@ -357,12 +363,17 @@ def _build_memory_ingress(config: ProShieldConfig) -> _IngressBundle:
     ingestion = SecurityEventIngestionService(
         SecurityEventRepository(db=db, config=config), config,
     )
+    # Capability patch gap 9: per-source ingest telemetry, maintained
+    # at THIS boundary and persisted for the analyst plane.
+    telemetry = SourceTelemetryStore(db=db, config=config)
+    telemetry.ensure_ready()
     ingress = InboundIngressProxy(
         config=config,
         registry=registry,
         token_verifier=verifier,
         ingestion_service=ingestion,
         authoritative_source_resolver=lambda sid: repo.get(sid),
+        telemetry_recorder=telemetry,
     )
     pipeline = _build_ingress_pipeline(config, db, ingestion)
     return _IngressBundle(

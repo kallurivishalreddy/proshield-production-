@@ -255,6 +255,25 @@ class SecurityEventProvenance(_StrictModel):
             ),
         ]
     ] = None
+    # Phase 5.2 — Source Architecture 2.0. The capability that owned the
+    # authenticated source instance when this event was ingested. It is
+    # **derived metadata**: the ingress boundary reads it from the
+    # server-side SourceInstance that the source token authenticated, and
+    # a ``capability_id`` supplied inside the request payload is ignored
+    # (freeze §8.1 — untrusted telemetry must not self-declare trusted
+    # provenance). ``None`` is the honest "not stamped" state for events
+    # ingested before Phase 5.2 or outside the binding-aware ingress; it is
+    # never back-filled with a guess (freeze §38).
+    capability_id: Optional[
+        Annotated[
+            str,
+            StringConstraints(
+                min_length=5,
+                max_length=64,
+                pattern=r"^cap-[a-z][a-z0-9-]{1,47}$",
+            ),
+        ]
+    ] = None
 
 
 class SecurityEvent(_StrictModel):
@@ -465,6 +484,28 @@ def _reject_unsafe_bson_keys(obj: Any, *, path: str) -> None:
     elif isinstance(obj, list):
         for i, item in enumerate(obj):
             _reject_unsafe_bson_keys(item, path=f"{path}[{i}]")
+
+
+def capability_id_of_event(event: Any) -> Optional[str]:
+    """Return the **server-derived** capability of an event, or ``None``.
+
+    Phase 5.2 stores the capability in the event's provenance because
+    provenance answers "where did this come from". This helper is the one
+    place that knows that, so the detection / rule-selection path never
+    has to guess at a shape.
+
+    It deliberately reads provenance only: an unknown / hand-built event
+    object yields ``None`` rather than raising, so an un-stamped legacy
+    event flows through the dual-read rule resolution instead of blowing
+    up the hot path.
+    """
+    provenance = getattr(event, "provenance", None)
+    if provenance is None:
+        return None
+    value = getattr(provenance, "capability_id", None)
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 def to_canonical_dict(event: SecurityEvent) -> Dict[str, Any]:

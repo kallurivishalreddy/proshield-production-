@@ -81,6 +81,16 @@ OP_SOURCE_DISABLE = "source.disable"
 OP_SOURCE_RETIRE = "source.retire"
 OP_SOURCE_ISSUE_TOKEN = "source.issue_token"
 
+# Phase 5.2 (Source Architecture 2.0) wire operations. These are the
+# client-facing surface for capability binding, credential rotation and
+# the legacy-migration status/apply contract. Nothing here is reachable
+# from the trusted ingress boundary, and every write is admin-gated.
+OP_SOURCE_BIND_CAPABILITY = "source.bind_capability"
+OP_SOURCE_ROTATE_TOKEN = "source.rotate_token"
+OP_SOURCE_AUDIT = "source.audit"
+OP_SOURCE_MIGRATION_STATUS = "source.migration_status"
+OP_SOURCE_MIGRATE = "source.migrate"
+
 # Phase 3 frontend-required operations: detection, correlation,
 # overview aggregate, timeline, rule management.
 OP_EVENT_LIST = "event.list"
@@ -100,6 +110,35 @@ OP_RULE_VERSION = "rule.version"
 OP_RULE_ENABLE = "rule.enable"
 OP_RULE_DISABLE = "rule.disable"
 OP_RULE_RETIRE = "rule.retire"
+
+# Capability-patch wire operations (gaps 1-15). See
+# docs/PHASE 4/PROSHIELD-BACKEND-CAPABILITY-PATCH-REPORT.md.
+OP_CASE_ACKNOWLEDGE = "case.acknowledge"
+OP_CASE_INVESTIGATE = "case.investigate"
+OP_CASE_ADD_NOTE = "case.note.add"
+OP_CASE_CREATE_FROM_CORRELATION = "case.create_from_correlation"
+OP_CORRELATION_LIST_PATTERNS = "correlation.list_patterns"
+OP_SYSTEM_HEALTH_DEEP = "system.health.deep"
+OP_NOTIFICATION_LIST = "notification.list"
+OP_NOTIFICATION_MARK_READ = "notification.mark_read"
+OP_NOTIFICATION_UNREAD_COUNT = "notification.unread_count"
+OP_TIMELINE_GLOBAL_QUERY = "timeline.global_query"
+OP_OVERVIEW_TIMESERIES = "overview.timeseries"
+
+# Phase 5.1: Capability Registry wire operations.
+OP_CAPABILITY_LIST = "capability.list"
+OP_CAPABILITY_GET = "capability.get"
+OP_CAPABILITY_CREATE = "capability.create"
+OP_CAPABILITY_UPDATE = "capability.update"
+OP_CAPABILITY_ENABLE = "capability.enable"
+OP_CAPABILITY_DISABLE = "capability.disable"
+OP_CAPABILITY_DEPRECATE = "capability.deprecate"
+OP_CAPABILITY_RETIRE = "capability.retire"
+OP_CAPABILITY_ARCHIVE = "capability.archive"
+OP_CAPABILITY_LIST_SOURCES = "capability.list_sources"
+OP_CAPABILITY_LIST_RULES = "capability.list_rules"
+OP_CAPABILITY_LIST_PATTERNS = "capability.list_patterns"
+OP_CAPABILITY_AUDIT = "capability.audit"
 
 # AUTH-001 credential header: the credential can be supplied
 # via the ``X-ProShield-Credential`` header OR in the body as
@@ -133,6 +172,12 @@ ALLOWED_OPERATIONS: frozenset = frozenset({
     OP_SOURCE_DISABLE,
     OP_SOURCE_RETIRE,
     OP_SOURCE_ISSUE_TOKEN,
+    # Phase 5.2
+    OP_SOURCE_BIND_CAPABILITY,
+    OP_SOURCE_ROTATE_TOKEN,
+    OP_SOURCE_AUDIT,
+    OP_SOURCE_MIGRATION_STATUS,
+    OP_SOURCE_MIGRATE,
     OP_DETECTION_LIST,
     OP_DETECTION_GET,
     OP_DETECTION_LIST_FOR_INCIDENT,
@@ -149,6 +194,30 @@ ALLOWED_OPERATIONS: frozenset = frozenset({
     OP_RULE_ENABLE,
     OP_RULE_DISABLE,
     OP_RULE_RETIRE,
+    OP_CASE_ACKNOWLEDGE,
+    OP_CASE_INVESTIGATE,
+    OP_CASE_ADD_NOTE,
+    OP_CASE_CREATE_FROM_CORRELATION,
+    OP_CORRELATION_LIST_PATTERNS,
+    OP_SYSTEM_HEALTH_DEEP,
+    OP_NOTIFICATION_LIST,
+    OP_NOTIFICATION_MARK_READ,
+    OP_NOTIFICATION_UNREAD_COUNT,
+    OP_TIMELINE_GLOBAL_QUERY,
+    OP_OVERVIEW_TIMESERIES,
+    OP_CAPABILITY_LIST,
+    OP_CAPABILITY_GET,
+    OP_CAPABILITY_CREATE,
+    OP_CAPABILITY_UPDATE,
+    OP_CAPABILITY_ENABLE,
+    OP_CAPABILITY_DISABLE,
+    OP_CAPABILITY_DEPRECATE,
+    OP_CAPABILITY_RETIRE,
+    OP_CAPABILITY_ARCHIVE,
+    OP_CAPABILITY_LIST_SOURCES,
+    OP_CAPABILITY_LIST_RULES,
+    OP_CAPABILITY_LIST_PATTERNS,
+    OP_CAPABILITY_AUDIT,
 })
 
 MAX_PROXY_REQUEST_BYTES = 32_768
@@ -274,6 +343,16 @@ class SecureProxy:
         self._timeline_service: Optional[TimelineReadService] = None
         self._rule_management_service: Optional[RuleManagementService] = None
         self._security_event_repository: Optional[Any] = None
+        # Capability patch services (gaps 1-15); attached lazily so
+        # the proxy-without-services fixtures keep working.
+        self._notification_service: Optional[Any] = None
+        self._deep_health_service: Optional[Any] = None
+        self._source_telemetry_store: Optional[Any] = None
+        # Phase 5.1 capability registry; attached lazily.
+        self._capability_service: Optional[Any] = None
+        # Phase 5.2 source -> capability binding surface; attached lazily.
+        self._source_capability_migration: Optional[Any] = None
+        self._source_audit_collection: Optional[Any] = None
         self._rate_limiter = _RateLimiter(
             window_seconds=60,
             budget=int(config.proxy_rate_limit_per_minute),
@@ -357,6 +436,24 @@ class SecureProxy:
                 f"{missing}"
             )
         self._source_management_service = service
+
+    def attach_source_capability_migration(
+        self, migration: Any, *, audit_collection: Any = None,
+    ) -> None:
+        """Attach the Phase 5.2 legacy capability migration engine.
+
+        Duck-typed (``run(dry_run=..., actor=..., include_rules=...)``)
+        for the same no-circular-import reason as the source service. The
+        optional ``audit_collection`` is only used for the read-only audit
+        surface; the migration engine owns its own audit writes.
+        """
+        if migration is not None and not hasattr(migration, "run"):
+            raise ValueError(
+                "source capability migration must expose run()"
+            )
+        self._source_capability_migration = migration
+        if audit_collection is not None:
+            self._source_audit_collection = audit_collection
 
     def attach_detection_service(
         self, service: Optional[DetectionReadService],
@@ -451,6 +548,38 @@ class SecureProxy:
                 f"got {type(service).__name__}"
             )
         self._rule_management_service = service
+
+    def attach_notification_service(
+        self, service: Optional[Any],
+    ) -> None:
+        """Attach the notification feed service (capability gap 12).
+
+        Duck-typed so the proxy does not import the notifications
+        package at module load time.
+        """
+        self._notification_service = service
+
+    def attach_deep_health_service(
+        self, service: Optional[Any],
+    ) -> None:
+        """Attach the deep health service (capability gap 8)."""
+        self._deep_health_service = service
+
+    def attach_source_telemetry(self, store: Optional[Any]) -> None:
+        """Attach the per-source telemetry store (capability gap 9).
+
+        When wired, ``source.list`` merges the truthful ingest
+        counters into each source view.
+        """
+        self._source_telemetry_store = store
+
+    def attach_capability_service(self, service: Optional[Any]) -> None:
+        """Attach the Phase 5.1 capability registry service.
+
+        Duck-typed so the proxy does not import the capabilities
+        package at module load time.
+        """
+        self._capability_service = service
 
     # ----- request dispatch
     def handle(self, request: ProxyRequest) -> ProxyResponse:
@@ -722,6 +851,17 @@ class SecureProxy:
             return self._handle_source_retire(request, identity)
         if op == OP_SOURCE_ISSUE_TOKEN:
             return self._handle_source_issue_token(request, identity)
+        # Phase 5.2 — Source Architecture 2.0 wire surface.
+        if op == OP_SOURCE_BIND_CAPABILITY:
+            return self._handle_source_bind_capability(request, identity)
+        if op == OP_SOURCE_ROTATE_TOKEN:
+            return self._handle_source_rotate_token(request, identity)
+        if op == OP_SOURCE_AUDIT:
+            return self._handle_source_audit(request, identity)
+        if op == OP_SOURCE_MIGRATION_STATUS:
+            return self._handle_source_migration_status(request, identity)
+        if op == OP_SOURCE_MIGRATE:
+            return self._handle_source_migrate(request, identity)
         if op == OP_EVENT_LIST:
             return self._handle_event_list(request, identity)
         if op == OP_DETECTION_LIST:
@@ -764,6 +904,62 @@ class SecureProxy:
             return self._handle_rule_retire(request, identity)
         if op == OP_REPORT_EXPORT:
             return self._handle_report_export(request, identity)
+        # ----- capability patch ops (gaps 1-15)
+        if op == OP_CASE_ACKNOWLEDGE:
+            return self._handle_case_acknowledge(request, identity)
+        if op == OP_CASE_INVESTIGATE:
+            return self._handle_case_investigate(request, identity)
+        if op == OP_CASE_ADD_NOTE:
+            return self._handle_case_add_note(request, identity)
+        if op == OP_CASE_CREATE_FROM_CORRELATION:
+            return self._handle_case_create_from_correlation(
+                request, identity,
+            )
+        if op == OP_CORRELATION_LIST_PATTERNS:
+            return self._handle_correlation_list_patterns(
+                request, identity,
+            )
+        if op == OP_SYSTEM_HEALTH_DEEP:
+            return self._handle_system_health_deep(request, identity)
+        if op == OP_NOTIFICATION_LIST:
+            return self._handle_notification_list(request, identity)
+        if op == OP_NOTIFICATION_MARK_READ:
+            return self._handle_notification_mark_read(request, identity)
+        if op == OP_NOTIFICATION_UNREAD_COUNT:
+            return self._handle_notification_unread_count(
+                request, identity,
+            )
+        if op == OP_TIMELINE_GLOBAL_QUERY:
+            return self._handle_timeline_global_query(request, identity)
+        if op == OP_OVERVIEW_TIMESERIES:
+            return self._handle_overview_timeseries(request, identity)
+        # ----- Phase 5.1 capability registry ops
+        if op == OP_CAPABILITY_LIST:
+            return self._handle_capability_list(request, identity)
+        if op == OP_CAPABILITY_GET:
+            return self._handle_capability_get(request, identity)
+        if op == OP_CAPABILITY_CREATE:
+            return self._handle_capability_create(request, identity)
+        if op == OP_CAPABILITY_UPDATE:
+            return self._handle_capability_update(request, identity)
+        if op == OP_CAPABILITY_ENABLE:
+            return self._handle_capability_enable(request, identity)
+        if op == OP_CAPABILITY_DISABLE:
+            return self._handle_capability_disable(request, identity)
+        if op == OP_CAPABILITY_DEPRECATE:
+            return self._handle_capability_deprecate(request, identity)
+        if op == OP_CAPABILITY_RETIRE:
+            return self._handle_capability_retire(request, identity)
+        if op == OP_CAPABILITY_ARCHIVE:
+            return self._handle_capability_archive(request, identity)
+        if op == OP_CAPABILITY_LIST_SOURCES:
+            return self._handle_capability_list_sources(request, identity)
+        if op == OP_CAPABILITY_LIST_RULES:
+            return self._handle_capability_list_rules(request, identity)
+        if op == OP_CAPABILITY_LIST_PATTERNS:
+            return self._handle_capability_list_patterns(request, identity)
+        if op == OP_CAPABILITY_AUDIT:
+            return self._handle_capability_audit(request, identity)
         raise InvalidProxyRequestError(
             safe_message="unknown operation",
             internal_detail=f"operation={op!r}",
@@ -948,6 +1144,303 @@ class SecureProxy:
             reason=str(reason),
         )
         return self._shape_ok({"case": case.to_dict()})
+
+    # --------------------------------------------------- capability patch ops
+    def _require_incident_service(self) -> IncidentService:
+        if self._incident_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="incident service unavailable",
+                internal_detail="proxy not wired",
+            )
+        return self._incident_service
+
+    def _handle_case_acknowledge(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """``case.acknowledge`` — open -> acknowledged (gap 1)."""
+        self._require(identity, Permission.CASE_READ)
+        service = self._require_incident_service()
+        body = request.body or {}
+        incident_id = body.get("incident_id")
+        reason = body.get("reason") or ""
+        if not isinstance(incident_id, str) or not incident_id:
+            raise InvalidProxyRequestError(
+                safe_message="incident_id required",
+                internal_detail="missing incident_id",
+                field="incident_id",
+            )
+        case = service.acknowledge_case(
+            identity=identity, incident_id=incident_id,
+            reason=str(reason),
+        )
+        return self._shape_ok({"case": case.to_dict()})
+
+    def _handle_case_investigate(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """``case.investigate`` — open|acknowledged -> investigating (gap 1)."""
+        self._require(identity, Permission.CASE_READ)
+        service = self._require_incident_service()
+        body = request.body or {}
+        incident_id = body.get("incident_id")
+        reason = body.get("reason") or ""
+        if not isinstance(incident_id, str) or not incident_id:
+            raise InvalidProxyRequestError(
+                safe_message="incident_id required",
+                internal_detail="missing incident_id",
+                field="incident_id",
+            )
+        case = service.investigate_case(
+            identity=identity, incident_id=incident_id,
+            reason=str(reason),
+        )
+        return self._shape_ok({"case": case.to_dict()})
+
+    def _handle_case_add_note(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """``case.note.add`` — append an immutable analyst note (gap 4)."""
+        self._require(identity, Permission.CASE_READ)
+        service = self._require_incident_service()
+        body = request.body or {}
+        incident_id = body.get("incident_id")
+        note_body = body.get("body")
+        if not isinstance(incident_id, str) or not incident_id:
+            raise InvalidProxyRequestError(
+                safe_message="incident_id required",
+                internal_detail="missing incident_id",
+                field="incident_id",
+            )
+        if not isinstance(note_body, str) or not note_body.strip():
+            raise InvalidProxyRequestError(
+                safe_message="note body required",
+                internal_detail="missing note body",
+                field="body",
+            )
+        case = service.add_note(
+            identity=identity, incident_id=incident_id,
+            body=note_body,
+        )
+        return self._shape_ok({
+            "case": case.to_dict(),
+            "note": case.notes[-1].to_dict() if case.notes else None,
+        })
+
+    def _handle_case_create_from_correlation(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """``case.create_from_correlation`` — analyst case creation (gap 11).
+
+        The Phase 4.8 boundary is preserved: the proxy NEVER builds
+        case evidence from the request payload. The correlation and
+        its member detections/events are resolved from persistence,
+        then the SAME internal case assembly the pipeline uses runs
+        (idempotent on the cluster's deterministic case id).
+        """
+        self._require(identity, Permission.CASE_READ)
+        service = self._require_incident_service()
+        if self._correlation_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="correlation service unavailable",
+                internal_detail="proxy not wired",
+            )
+        body = request.body or {}
+        correlation_id = body.get("correlation_id")
+        if not isinstance(correlation_id, str) or not correlation_id:
+            raise InvalidProxyRequestError(
+                safe_message="correlation_id required",
+                internal_detail="missing correlation_id",
+                field="correlation_id",
+            )
+        correlation = self._correlation_service.get(correlation_id)
+        # Server-side evidence resolution (never the caller's payload).
+        detections = []
+        if self._detection_service is not None:
+            from ..domain.errors import NotFoundError as _NFE
+
+            for det_id in correlation.detection_ids:
+                try:
+                    row = self._detection_service.get(det_id)
+                except _NFE:
+                    # Missing evidence is skipped (the same policy the
+                    # timeline uses); it is never fabricated.
+                    row = None
+                if row is not None:
+                    detections.append(row)
+        events = []
+        if self._security_event_repository is not None:
+            for ev_id in correlation.event_ids:
+                try:
+                    ev = self._security_event_repository.get_by_event_id(
+                        ev_id
+                    )
+                except Exception:  # noqa: BLE001 - missing evidence skipped
+                    ev = None
+                if ev is not None:
+                    events.append(ev)
+        case = service.create_case_for_correlation(
+            identity=identity,
+            correlation=correlation,
+            events=events,
+            detections=detections,
+            title=body.get("title") or None,
+            summary=body.get("summary") or None,
+        )
+        # Idempotency truth: a freshly created case has
+        # created_at == updated_at (same composition instant); a
+        # reused/merged case keeps its original created_at.
+        return self._shape_ok({
+            "case": case.to_dict(),
+            "correlation_id": correlation.correlation_id,
+            "created": case.created_at == case.updated_at,
+            "evidence_resolved": {
+                "events": len(events),
+                "detections": len(detections),
+            },
+        })
+
+    def _handle_correlation_list_patterns(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """``correlation.list_patterns`` — live pattern catalogue (gap 7)."""
+        self._require(identity, Permission.CORRELATION_READ)
+        if self._correlation_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="correlation service unavailable",
+                internal_detail="proxy not wired",
+            )
+        patterns = self._correlation_service.list_patterns()
+        return self._shape_ok({"patterns": patterns})
+
+    def _handle_system_health_deep(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """``system.health.deep`` — per-subsystem truth (gap 8).
+
+        OWNER-52-03 (Phase 5.2 baseline): the report names every
+        subsystem, its status and its counts (collections, cases,
+        detections, sources). That is operationally sensitive, so the
+        operation requires the documented read permission for the
+        operational surfaces instead of being reachable by any
+        authenticated session (the semi-trusted collector role included).
+        """
+        self._require(identity, Permission.OVERVIEW_READ)
+        if self._deep_health_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="deep health service unavailable",
+                internal_detail="proxy not wired",
+            )
+        report = self._deep_health_service.run_checks()
+        return self._shape_ok({"health": report})
+
+    def _handle_notification_list(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """``notification.list`` — real backend event feed (gap 12)."""
+        if self._notification_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="notification service unavailable",
+                internal_detail="proxy not wired",
+            )
+        body = request.body or {}
+        unread_only = bool(body.get("unread_only", False))
+        limit = body.get("limit")
+        items = self._notification_service.list_for_identity(
+            identity=identity,
+            unread_only=unread_only,
+            limit=limit if isinstance(limit, int) else None,
+        )
+        return self._shape_ok({
+            "notifications": items,
+            "count": len(items),
+        })
+
+    def _handle_notification_mark_read(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """``notification.mark_read`` (gap 12)."""
+        if self._notification_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="notification service unavailable",
+                internal_detail="proxy not wired",
+            )
+        body = request.body or {}
+        notification_id = body.get("notification_id")
+        if not isinstance(notification_id, str) or not notification_id:
+            raise InvalidProxyRequestError(
+                safe_message="notification_id required",
+                internal_detail="missing notification_id",
+                field="notification_id",
+            )
+        updated = self._notification_service.mark_read(
+            identity=identity, notification_id=notification_id,
+        )
+        return self._shape_ok({"notification": updated})
+
+    def _handle_notification_unread_count(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """``notification.unread_count`` (gap 12)."""
+        if self._notification_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="notification service unavailable",
+                internal_detail="proxy not wired",
+            )
+        return self._shape_ok(
+            self._notification_service.unread_count(identity=identity)
+        )
+
+    def _handle_timeline_global_query(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """``timeline.global_query`` — cross-case timeline (gap 13)."""
+        self._require(identity, Permission.TIMELINE_READ)
+        if self._timeline_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="timeline service unavailable",
+                internal_detail="proxy not wired",
+            )
+        body = request.body or {}
+        since = self._coerce_iso(body.get("since"), "since")
+        until = self._coerce_iso(body.get("until"), "until")
+        kinds = body.get("kinds")
+        if kinds is not None and (
+            not isinstance(kinds, list)
+            or not all(isinstance(k, str) for k in kinds)
+        ):
+            raise InvalidProxyRequestError(
+                safe_message="kinds must be a list of strings",
+                internal_detail=f"got {type(kinds).__name__}",
+                field="kinds",
+            )
+        limit = body.get("limit")
+        offset = body.get("offset")
+        result = self._timeline_service.global_query(
+            since=since,
+            until=until,
+            kinds=tuple(kinds) if kinds else None,
+            limit=limit if isinstance(limit, int) else 200,
+            offset=offset if isinstance(offset, int) else 0,
+        )
+        return self._shape_ok(result)
+
+    def _handle_overview_timeseries(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """``overview.timeseries`` — server-side aggregates (gap 15)."""
+        self._require(identity, Permission.OVERVIEW_READ)
+        if self._overview_service is None:
+            raise InvalidProxyRequestError(
+                safe_message="overview service unavailable",
+                internal_detail="proxy not wired",
+            )
+        body = request.body or {}
+        hours = body.get("hours")
+        result = self._overview_service.timeseries(
+            identity,
+            hours=hours if isinstance(hours, int) else 24,
+        )
+        return self._shape_ok(result)
 
     def _handle_request_centralized(
         self, request: ProxyRequest, identity: Identity
@@ -1222,11 +1715,66 @@ class SecureProxy:
             )
         return svc
 
+    def _require_source_migration(self) -> Any:
+        """Return the Phase 5.2 migration engine or fail loudly.
+
+        A missing engine is a wiring error, not a silent empty report: an
+        operator must never see "0 changes" because the engine was absent.
+        """
+        engine = self._source_capability_migration
+        if engine is None:
+            raise InvalidProxyRequestError(
+                safe_message="source capability migration unavailable",
+                internal_detail="proxy not wired",
+            )
+        return engine
+
+    def _source_audit_records(
+        self, source_instance_id: Optional[str], *, limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Read the bounded source audit trail, or [] when not wired."""
+        collection = self._source_audit_collection
+        if collection is None:
+            return []
+        from ..sources.audit import (
+            read_audit_records,
+            read_recent_audit_records,
+        )
+
+        if source_instance_id:
+            return read_audit_records(
+                collection, source_instance_id, limit=limit
+            )
+        return read_recent_audit_records(collection, limit=limit)
+
     def _view_to_dict(self, view: Any) -> Dict[str, Any]:
         if hasattr(view, "model_dump"):
             # ``mode="json"`` stringifies datetimes so the
             # response is wire-shape JSON-safe.
             return view.model_dump(mode="json")
+        if isinstance(view, dict):
+            # Phase 5.1 capability views carry datetimes; stringify
+            # them here so _shape_ok json.dumps never 500s.
+            out: Dict[str, Any] = {}
+            for key, value in view.items():
+                if isinstance(value, datetime):
+                    out[key] = value.isoformat()
+                elif isinstance(value, list):
+                    converted = []
+                    for entry in value:
+                        if isinstance(entry, datetime):
+                            converted.append(entry.isoformat())
+                        elif isinstance(entry, dict):
+                            converted.append({
+                                k: (v.isoformat() if isinstance(v, datetime) else v)
+                                for k, v in entry.items()
+                            })
+                        else:
+                            converted.append(entry)
+                    out[key] = converted
+                else:
+                    out[key] = value
+            return out
         return dict(view)
 
     def _handle_source_list(
@@ -1240,8 +1788,22 @@ class SecureProxy:
         self._require(identity, Permission.RULE_READ)
         svc = self._require_source_service()
         views = svc.list_all()
+        # Capability patch gap 9: merge the truthful per-source ingest
+        # telemetry (counters maintained at the ingress boundary) into
+        # each view. No store wired / no data -> explicit nulls, never
+        # zero-dressed-up-as-observed.
+        telemetry = (
+            self._source_telemetry_store.snapshot_all()
+            if self._source_telemetry_store is not None else {}
+        )
+        sources: List[Dict[str, Any]] = []
+        for view in views:
+            item = self._view_to_dict(view)
+            snap = telemetry.get(view.source_instance_id)
+            item["ingest_telemetry"] = dict(snap) if snap else None
+            sources.append(item)
         return self._shape_ok({
-            "sources": [self._view_to_dict(v) for v in views],
+            "sources": sources,
             "supported_connector_types": [
                 t.value for t in svc.list_supported_connector_types()
             ],
@@ -1308,6 +1870,35 @@ class SecureProxy:
                 field="source_type",
             )
         svc = self._require_source_service()
+        # Phase 5.2: an explicitly requested capability binding is honoured
+        # (and validated) rather than silently discarded. The service is the
+        # authority: an unknown capability, a capability that does not
+        # implement this source's connector, or an undeclared mapping
+        # profile is a 400. A client may *request* a capability; it can never
+        # *choose* one the server would not derive or accept.
+        requested_capability_id = body.get("capability_id")
+        if requested_capability_id is not None and (
+            not isinstance(requested_capability_id, str)
+            or not requested_capability_id
+        ):
+            raise InvalidProxyRequestError(
+                safe_message="capability_id must be a non-empty string",
+                internal_detail=(
+                    f"got {type(requested_capability_id).__name__}"
+                ),
+                field="capability_id",
+            )
+        requested_mapping_profile_id = body.get("mapping_profile_id")
+        if requested_mapping_profile_id is not None and not isinstance(
+            requested_mapping_profile_id, str
+        ):
+            raise InvalidProxyRequestError(
+                safe_message="mapping_profile_id must be a string",
+                internal_detail=(
+                    f"got {type(requested_mapping_profile_id).__name__}"
+                ),
+                field="mapping_profile_id",
+            )
         # STRIX F-5 / N-3: normalize tag ordering/duplicates server-side
         # so a registry with legitimately sorted-unique tags is the ONLY
         # accepted shape, and escape a Pydantic ValidationError to 400
@@ -1320,6 +1911,8 @@ class SecureProxy:
                 description=str(body.get("description", "")),
                 tags=_normalize_tags(body.get("tags")),
                 asset_tags=_normalize_tags(body.get("asset_tags")),
+                capability_id=requested_capability_id,
+                mapping_profile_id=requested_mapping_profile_id,
             )
         except DomainValidationError:
             raise
@@ -1478,6 +2071,135 @@ class SecureProxy:
             "source_token": packed,
         })
 
+    # ============================================================= Phase 5.2
+    def _handle_source_bind_capability(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """Authoritatively bind/re-bind a source instance to a capability."""
+        self._require(identity, Permission.SOURCE_WRITE)
+        body = request.body or {}
+        sid = body.get("source_instance_id")
+        if not isinstance(sid, str) or not sid:
+            raise InvalidProxyRequestError(
+                safe_message="source_instance_id required",
+                internal_detail="missing source_instance_id",
+                field="source_instance_id",
+            )
+        capability_id = body.get("capability_id")
+        if not isinstance(capability_id, str) or not capability_id:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        mapping_profile_id = body.get("mapping_profile_id")
+        if mapping_profile_id is not None and (
+            not isinstance(mapping_profile_id, str)
+        ):
+            raise InvalidProxyRequestError(
+                safe_message="mapping_profile_id must be a string",
+                internal_detail=(
+                    f"got {type(mapping_profile_id).__name__}"
+                ),
+                field="mapping_profile_id",
+            )
+        svc = self._require_source_service()
+        view = svc.bind_capability(
+            identity=identity,
+            source_instance_id=sid,
+            capability_id=capability_id,
+            mapping_profile_id=mapping_profile_id,
+        )
+        return self._shape_ok({"source": self._view_to_dict(view)})
+
+    def _handle_source_rotate_token(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """Rotate a source credential (issue a fresh single-use token)."""
+        self._require(identity, Permission.SOURCE_WRITE)
+        body = request.body or {}
+        sid = body.get("source_instance_id")
+        if not isinstance(sid, str) or not sid:
+            raise InvalidProxyRequestError(
+                safe_message="source_instance_id required",
+                internal_detail="missing source_instance_id",
+                field="source_instance_id",
+            )
+        svc = self._require_source_service()
+        packed = svc.rotate_ingress_token(
+            identity=identity, source_instance_id=sid,
+        )
+        return self._shape_ok({
+            "source_instance_id": sid,
+            "source_token": packed,
+            "rotated": True,
+        })
+
+    def _handle_source_audit(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """Bounded, newest-first source audit trail for one source."""
+        self._require(identity, Permission.SOURCE_READ)
+        body = request.body or {}
+        sid = body.get("source_instance_id")
+        if not isinstance(sid, str) or not sid:
+            raise InvalidProxyRequestError(
+                safe_message="source_instance_id required",
+                internal_detail="missing source_instance_id",
+                field="source_instance_id",
+            )
+        svc = self._require_source_service()
+        # Resolve first: an unknown source must 404 rather than return an
+        # empty trail that looks like "no changes were ever made"
+        # (the Phase 5.1 §28.7 lesson).
+        svc.get(sid)
+        records = self._source_audit_records(sid)
+        return self._shape_ok({
+            "source_instance_id": sid,
+            "audit": records,
+        })
+
+    def _handle_source_migration_status(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """Dry-run view of the legacy capability migration (read-only)."""
+        self._require(identity, Permission.SOURCE_READ)
+        engine = self._require_source_migration()
+        report = engine.run(dry_run=True)
+        payload = report.as_dict()
+        payload["audit_trail"] = self._source_audit_records(
+            None, limit=20
+        )
+        return self._shape_ok(payload)
+
+    def _handle_source_migrate(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """Apply the legacy capability migration (admin, dry_run capable)."""
+        self._require(identity, Permission.SOURCE_WRITE)
+        body = request.body or {}
+        dry_run = body.get("dry_run", True)
+        if not isinstance(dry_run, bool):
+            raise InvalidProxyRequestError(
+                safe_message="dry_run must be a boolean",
+                internal_detail=f"got {type(dry_run).__name__}",
+                field="dry_run",
+            )
+        include_rules = body.get("include_rules", True)
+        if not isinstance(include_rules, bool):
+            raise InvalidProxyRequestError(
+                safe_message="include_rules must be a boolean",
+                internal_detail=f"got {type(include_rules).__name__}",
+                field="include_rules",
+            )
+        engine = self._require_source_migration()
+        report = engine.run(
+            dry_run=dry_run,
+            actor=identity.subject_id,
+            include_rules=include_rules,
+        )
+        return self._shape_ok(report.as_dict())
+
     # ============================================================
     # Phase 4.9 — Frontend-required operation handlers
     # ------------------------------------------------------------
@@ -1561,6 +2283,238 @@ class SecureProxy:
                 internal_detail="proxy not wired",
             )
         return svc
+
+    def _require_capability_service(self) -> Any:
+        svc = self._capability_service
+        if svc is None:
+            raise InvalidProxyRequestError(
+                safe_message="capability service unavailable",
+                internal_detail="proxy not wired",
+            )
+        return svc
+
+    # ----- Phase 5.1 capability handlers
+    def _handle_capability_list(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_READ)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        status = body.get("status")
+        limit = body.get("limit", 50)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            raise InvalidProxyRequestError(
+                safe_message="limit must be an integer",
+                internal_detail=f"got {limit!r}",
+                field="limit",
+            )
+        items = [self._view_to_dict(v) for v in svc.list(status=status, limit=limit)]
+        return self._shape_ok({"capabilities": items, "count": len(items)})
+
+    def _handle_capability_get(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_READ)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        cid = body.get("capability_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        return self._shape_ok({"capability": self._view_to_dict(svc.get(cid))})
+
+    def _handle_capability_create(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_WRITE)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        created = svc.create(
+            identity=identity,
+            capability_id=body.get("capability_id", ""),
+            name=body.get("name", ""),
+            description=body.get("description", ""),
+            responsibility=body.get("responsibility", ""),
+            implementation_ref=body.get("implementation_ref", "planned"),
+            version=body.get("version", 1),
+            status=body.get("status"),
+            configuration_schema=body.get("configuration_schema", {}),
+            mapping_profiles=body.get("mapping_profiles", []),
+        )
+        return self._shape_ok({"capability": self._view_to_dict(created)})
+
+    def _handle_capability_update(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_WRITE)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        cid = body.get("capability_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        updated = svc.update(
+            identity=identity,
+            capability_id=cid,
+            name=body.get("name"),
+            description=body.get("description"),
+            responsibility=body.get("responsibility"),
+            configuration_schema=body.get("configuration_schema"),
+            mapping_profiles=body.get("mapping_profiles"),
+            version=body.get("version"),
+        )
+        return self._shape_ok({"capability": self._view_to_dict(updated)})
+
+    def _handle_capability_enable(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_WRITE)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        cid = body.get("capability_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        return self._shape_ok({"capability": self._view_to_dict(svc.enable(identity=identity, capability_id=cid))})
+
+    def _handle_capability_disable(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_WRITE)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        cid = body.get("capability_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        return self._shape_ok({"capability": self._view_to_dict(svc.disable(identity=identity, capability_id=cid))})
+
+    def _handle_capability_deprecate(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_WRITE)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        cid = body.get("capability_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        return self._shape_ok({"capability": self._view_to_dict(svc.deprecate(identity=identity, capability_id=cid))})
+
+    def _handle_capability_retire(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_WRITE)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        cid = body.get("capability_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        return self._shape_ok({"capability": self._view_to_dict(svc.retire(identity=identity, capability_id=cid))})
+
+    def _handle_capability_archive(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_WRITE)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        cid = body.get("capability_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        return self._shape_ok({"capability": self._view_to_dict(svc.archive(identity=identity, capability_id=cid))})
+
+    def _handle_capability_list_sources(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_READ)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        cid = body.get("capability_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        view = svc.list_sources(cid, limit=body.get("limit", 50))
+        view["sources"] = [self._view_to_dict(v) for v in view.get("sources", [])]
+        return self._shape_ok(view)
+
+    def _handle_capability_list_rules(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_READ)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        cid = body.get("capability_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        return self._shape_ok(svc.list_rules(cid, limit=body.get("limit", 50)))
+
+    def _handle_capability_list_patterns(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        self._require(identity, Permission.CAPABILITY_READ)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        cid = body.get("capability_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        return self._shape_ok(svc.list_patterns(cid))
+
+    def _handle_capability_audit(
+        self, request: ProxyRequest, identity: Identity
+    ) -> ProxyResponse:
+        """§18.27 audit read (append-only trail for one capability)."""
+        self._require(identity, Permission.CAPABILITY_READ)
+        svc = self._require_capability_service()
+        body = request.body or {}
+        cid = body.get("capability_id")
+        if not isinstance(cid, str) or not cid:
+            raise InvalidProxyRequestError(
+                safe_message="capability_id required",
+                internal_detail="missing capability_id",
+                field="capability_id",
+            )
+        limit = body.get("limit", 50)
+        try:
+            limit_i = int(limit)
+        except (TypeError, ValueError):
+            limit_i = 50
+        return self._shape_ok(svc.list_audit(cid, limit=limit_i))
 
     def _handle_event_list(
         self, request: ProxyRequest, identity: Identity
@@ -2012,11 +2966,16 @@ class SecureProxy:
                 internal_detail="missing report_id",
                 field="report_id",
             )
-        if not isinstance(fmt, str) or fmt != "json":
+        if not isinstance(fmt, str) or fmt not in (
+            "json", "markdown", "csv", "pdf",
+        ):
+            # Capability patch gap 14: markdown / csv / pdf are now
+            # rendered server-side from the REAL persisted report by
+            # app.reports.exporter. Unknown formats stay a 400.
             raise InvalidProxyRequestError(
                 safe_message=(
-                    "unsupported export format; only 'json' is "
-                    "supported in Phase 4.10"
+                    "unsupported export format; supported formats: "
+                    "json, markdown, csv, pdf"
                 ),
                 internal_detail=f"format={fmt!r}",
                 field="format",
@@ -2024,10 +2983,31 @@ class SecureProxy:
         report: Report = self._report_service.get_report(
             identity=identity, report_id=rid,
         )
+        if fmt == "json":
+            return self._shape_ok({
+                "report_id": report.report_id,
+                "format": fmt,
+                "payload": report.to_dict(),
+            })
+        import base64
+
+        from ..reports.exporter import export_report
+
+        content, media_type, extension = export_report(report, fmt)
         return self._shape_ok({
             "report_id": report.report_id,
             "format": fmt,
-            "payload": report.to_dict(),
+            "media_type": media_type,
+            "file_extension": extension,
+            # Binary-safe transport (pdf); markdown/csv are utf-8.
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "content_bytes": len(content),
+            # Convenience text view for the JSON/text formats so the
+            # UI can preview without decoding.
+            "content_text": (
+                content.decode("utf-8") if fmt in ("markdown", "csv")
+                else None
+            ),
         })
 
 
@@ -2269,11 +3249,29 @@ __all__ = [
     "OP_SOURCE_ENABLE",
     "OP_SOURCE_GET",
     "OP_SOURCE_ISSUE_TOKEN",
+    "OP_SOURCE_BIND_CAPABILITY",
+    "OP_SOURCE_MIGRATE",
+    "OP_SOURCE_MIGRATION_STATUS",
+    "OP_SOURCE_ROTATE_TOKEN",
+    "OP_SOURCE_AUDIT",
     "OP_SOURCE_LIST",
     "OP_SOURCE_LIST_TYPES",
     "OP_SOURCE_REGISTER",
     "OP_SOURCE_RETIRE",
     "OP_SOURCE_VALIDATE",
+    "OP_CAPABILITY_LIST",
+    "OP_CAPABILITY_GET",
+    "OP_CAPABILITY_CREATE",
+    "OP_CAPABILITY_UPDATE",
+    "OP_CAPABILITY_ENABLE",
+    "OP_CAPABILITY_DISABLE",
+    "OP_CAPABILITY_DEPRECATE",
+    "OP_CAPABILITY_RETIRE",
+    "OP_CAPABILITY_ARCHIVE",
+    "OP_CAPABILITY_LIST_SOURCES",
+    "OP_CAPABILITY_LIST_RULES",
+    "OP_CAPABILITY_LIST_PATTERNS",
+    "OP_CAPABILITY_AUDIT",
     "PROXY_HEADER_AUTHORIZATION",
     "PROXY_HEADER_SESSION",
     "ProxyRequest",

@@ -47,6 +47,7 @@ from ..domain.errors import (
     PersistenceError,
     ValidationError,
 )
+from .human_ids import COUNTERS_COLLECTION, HumanIdAllocator
 
 
 # ----------------------------------------------------------------- index specs
@@ -62,6 +63,8 @@ INDEX_SPECS: List[Dict[str, Any]] = [
     },
     {"name": "corr_window", "key": [("window_start", DESCENDING)]},
     {"name": "corr_key", "key": [("key", ASCENDING)]},
+    # Phase 5.2 (§12): capability-scoped correlation lookup.
+    {"name": "corr_capability_ids", "key": [("capability_ids", ASCENDING)]},
 ]
 
 
@@ -116,6 +119,14 @@ CORRELATIONS_VALIDATOR: Dict[str, Any] = {
                 "bsonType": "array",
                 "items": {"bsonType": "string", "minLength": 1, "maxLength": 64},
             },
+            # Capability patch gaps 2+6: human id + composed confidence
+            # band. Optional (null for legacy rows) — never fabricated.
+            "confidence": {
+                "bsonType": ["string", "null"], "maxLength": 32,
+            },
+            "human_id": {
+                "bsonType": ["string", "null"], "maxLength": 32,
+            },
             "detection_ids": {
                 "bsonType": "array",
                 "items": {"bsonType": "string"},
@@ -130,6 +141,19 @@ CORRELATIONS_VALIDATOR: Dict[str, Any] = {
             "reasoning": {"bsonType": "string", "maxLength": 2048},
             "correlated_at": {"bsonType": "date"},
             "extra": {"bsonType": "object"},
+            # Phase 5.2 (§8/§12): capabilities derived from the member
+            # detections (sorted + de-duplicated by the model validator).
+            # Optional; an empty/absent list means no member detection
+            # carried a derived capability — never fabricated.
+            "capability_ids": {
+                "bsonType": "array",
+                "maxItems": 16,
+                "items": {
+                    "bsonType": "string",
+                    "maxLength": 64,
+                    "pattern": r"^cap-[a-z][a-z0-9-]{1,47}$",
+                },
+            },
         },
     }
 }
@@ -144,6 +168,14 @@ class CorrelationRepository:
         self._config = config
         self._collection_name: str = correlation_collection_name(config)
         self._collection: Collection = db[self._collection_name]
+        # Capability patch gaps 2+6: human-id assignment and
+        # confidence composition at the persistence boundary (every
+        # creation path — pipeline, centralized analysis, seeding —
+        # gets the composed band exactly once, deterministically).
+        counters = db[COUNTERS_COLLECTION]
+        if not hasattr(counters, "find_one_and_update"):
+            counters = None
+        self._human_ids = HumanIdAllocator(counters, "correlation")
 
     def ensure_schema(self) -> None:
         if self._collection_name in self._db.list_collection_names():
@@ -203,6 +235,17 @@ class CorrelationRepository:
                 safe_message="create() requires a Correlation",
                 internal_detail=f"got {type(correlation).__name__}",
             )
+        if not correlation.human_id:
+            correlation = correlation.model_copy(
+                update={"human_id": self._human_ids.allocate()},
+            )
+        if not correlation.confidence:
+            # Compose the documented confidence band once, at
+            # persistence (gap 6). Failure leaves the band empty —
+            # never a fabricated value, never a blocked write.
+            from ..severity.enrichment import enrich_correlation
+
+            correlation = enrich_correlation(correlation)
         try:
             payload = correlation.to_dict()
             from datetime import datetime
@@ -407,13 +450,18 @@ def _document_to_correlation(doc: Dict[str, Any]) -> Correlation:
     """
     from datetime import datetime, timezone
     cleaned = {k: v for k, v in doc.items() if k != "_id"}
+    # Capability patch gaps 2+6: wire-friendly None round-trips back
+    # to the model's "" default.
+    for blank_field in ("confidence", "human_id"):
+        if cleaned.get(blank_field) is None:
+            cleaned[blank_field] = ""
     if "key" in cleaned and isinstance(cleaned["key"], list):
         cleaned["key"] = CorrelationKey(parts=tuple(cleaned["key"]))
     if "extra" in cleaned and isinstance(cleaned["extra"], dict):
         cleaned["extra"] = tuple(sorted(cleaned["extra"].items()))
     # Convert list to tuple for tuple-typed fields (Pydantic
     # accepts both, but be explicit).
-    for f in ("detection_ids", "event_ids"):
+    for f in ("detection_ids", "event_ids", "capability_ids"):
         if f in cleaned and isinstance(cleaned[f], list):
             cleaned[f] = tuple(cleaned[f])
     # Re-attach UTC tzinfo to all timestamp fields.

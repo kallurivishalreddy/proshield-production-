@@ -1,0 +1,30 @@
+# ProShield - bundled *runtime* dependencies.
+#
+# Installed into <install>\runtime\Lib\site-packages by
+# packaging/build_windows.py.  These are the only packages the two backend
+# planes (scripts/proxy_server.py, scripts/ingress_server.py) need at runtime.
+#
+# Kept deliberately minimal and fully pinned so a release is reproducible and
+# the installed footprint stays small.  The desktop shell and the service host
+# are frozen executables built from packaging/requirements-build.txt, so no GUI
+# or Windows-service dependency leaks into this runtime.
+#
+# Verified against Python 3.13.3 on Windows x64.
+
+fastapi==0.141.1
+uvicorn==0.52.4
+pymongo==4.16.0
+pydantic==2.13.4
+
+# ---- transitive pins (recorded so resolution cannot drift) ----------------
+annotated-types==0.7.0
+anyio==4.14.2
+certifi==2026.2.25
+click==8.3.1
+dnspython==2.8.0
+h11==0.16.0
+idna==3.11
+pydantic_core==2.46.4
+sniffio==1.3.1
+starlette==1.6.0
+typing_extensions==4.15.0

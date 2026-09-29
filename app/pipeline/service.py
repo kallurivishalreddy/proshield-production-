@@ -40,6 +40,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..auth.identity import Identity, INTERNAL_SERVICE_ROLE
+from ..auth.permissions import Permission
 from ..correlation.engine import CorrelationEngine
 from ..correlation.models import Correlation
 from ..detection.models import Detection
@@ -121,9 +122,22 @@ class LivePipeline:
             else DEFAULT_CORRELATION_WINDOW
         )
         if case_identity is None:
+            # The live pipeline is a SYSTEM actor, not a wire principal:
+            # it owns every auto-case it opens (``created_by="pipeline"``).
+            # The explicit permission tuple is deliberate and is NOT
+            # reachable from the wire — the seeded ``internal`` subject
+            # resolves from the identity store with an EMPTY permission
+            # tuple, so role defaults apply there and ``case:read:any`` is
+            # never granted to a session identity. The grant is required
+            # because ``IncidentService.create_case_for_correlation`` now
+            # enforces the case ownership model before it merges evidence
+            # into an *existing* case (OWNER-52-01): without cross-owner
+            # read authority the pipeline could not accumulate evidence
+            # into a cluster that a human operator had already cased.
             case_identity = Identity(
                 subject_id="pipeline",
                 role=INTERNAL_SERVICE_ROLE,
+                permissions=(Permission.CASE_READ, Permission.CASE_READ_ANY),
             )
         self._case_identity = case_identity
 
@@ -359,13 +373,32 @@ class LivePipeline:
         correlation: Correlation,
         detections: Sequence[Detection],
     ) -> Any:
-        """Open an idempotent case for a correlation."""
+        """Open an idempotent case for a correlation.
+
+        Batch 1/2 T28 (evidence integrity): the engine result contains
+        **every** cluster active in the correlation window, while ``event``
+        and ``detections`` belong to the single event being processed. The
+        trigger event/detection were previously handed to *every* cluster's
+        case, so an unrelated cluster's case absorbed foreign evidence
+        (reproduced live: the T22 cluster's case held the T28 cluster's
+        detection ids and vice versa).
+
+        The event's own evidence is therefore only passed when the event is a
+        member of this correlation. Every correlation still opens its case
+        (create-if-missing) and the case composes its evidence from the
+        correlation catalogue, so nothing is lost for the cluster the event
+        actually belongs to.
+        """
         try:
+            member_event_ids = tuple(
+                getattr(correlation, "event_ids", ()) or ()
+            )
+            belongs = event.event_id in member_event_ids
             return self._incident_service.create_case_for_correlation(
                 identity=self._case_identity,
                 correlation=correlation,
-                events=[event],
-                detections=list(detections),
+                events=[event] if belongs else [],
+                detections=list(detections) if belongs else [],
             )
         except DomainError as exc:
             _log.warning(

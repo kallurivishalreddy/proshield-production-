@@ -753,20 +753,94 @@ class TestReportExport:
         assert data["report_id"] == report.report_id
         assert data["payload"]["report_id"] == report.report_id
 
-    def test_report_export_rejects_non_json_format(self) -> None:
+    def _report(self) -> Report:
+        return Report(
+            report_id="rpt-01234567-0123-7000-8000-000000000001",
+            incident_id="case-01234567-0123-7000-8000-000000000001",
+            mode="normal",
+            version=1,
+            title="test",
+            sections=(ReportSection(title="what_was_detected",
+                                    items=(ReportItem(kind="note",
+                                                      text="x"),)),),
+            generated_by="user-analyst-001",
+            generated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            evidence_references=(),
+            rule_references=(),
+            is_centralized=False,
+            centralized_correlation_ids=(),
+        )
+
+    def _export(self, proxy: SecureProxy, token: str, fmt: str,
+                report_id: str = (
+                    "rpt-01234567-0123-7000-8000-000000000001"
+                )):
+        return proxy.handle(ProxyRequest(
+            operation=OP_REPORT_EXPORT,
+            headers=_auth_headers(token),
+            body={"report_id": report_id, "format": fmt},
+        ))
+
+    def test_report_export_rejects_unknown_format(self) -> None:
+        """Capability patch gap 14: json/markdown/csv/pdf are the
+        documented supported formats; anything else stays a 400."""
         proxy = _build_report_proxy_with_export()
         analyst = _issue_token(proxy, "user-analyst-001")
-        resp = proxy.handle(ProxyRequest(
-            operation=OP_REPORT_EXPORT,
-            headers=_auth_headers(analyst),
-            body={
-                "report_id": (
-                    "rpt-00000000-0000-7000-8000-000000000000"
-                ),
-                "format": "pdf",
-            },
-        ))
+        resp = self._export(
+            proxy, analyst, "docx",
+            report_id="rpt-00000000-0000-7000-8000-000000000000",
+        )
         assert resp.status == 400
+
+    def test_report_export_markdown(self) -> None:
+        """Gap 14: markdown export renders the real report content."""
+        import base64
+
+        proxy = _build_report_proxy_with_export()
+        analyst = _issue_token(proxy, "user-analyst-001")
+        proxy._report_service._repository.create(self._report())
+        resp = self._export(proxy, analyst, "markdown")
+        assert resp.status == 200
+        data = resp.body["data"]
+        assert data["format"] == "markdown"
+        assert data["media_type"].startswith("text/markdown")
+        text = base64.b64decode(data["content_base64"]).decode("utf-8")
+        assert "# test" in text
+        assert "what_was_detected" in text
+        assert data["content_text"] == text
+
+    def test_report_export_csv(self) -> None:
+        import base64
+        import csv
+        import io
+
+        proxy = _build_report_proxy_with_export()
+        analyst = _issue_token(proxy, "user-analyst-001")
+        proxy._report_service._repository.create(self._report())
+        resp = self._export(proxy, analyst, "csv")
+        assert resp.status == 200
+        data = resp.body["data"]
+        assert data["format"] == "csv"
+        text = base64.b64decode(data["content_base64"]).decode("utf-8-sig")
+        rows = list(csv.reader(io.StringIO(text)))
+        assert rows[0][0] == "field"
+        assert any("what_was_detected" in r for r in rows)
+
+    def test_report_export_pdf(self) -> None:
+        import base64
+
+        proxy = _build_report_proxy_with_export()
+        analyst = _issue_token(proxy, "user-analyst-001")
+        proxy._report_service._repository.create(self._report())
+        resp = self._export(proxy, analyst, "pdf")
+        assert resp.status == 200
+        data = resp.body["data"]
+        assert data["format"] == "pdf"
+        raw = base64.b64decode(data["content_base64"])
+        assert raw.startswith(b"%PDF-1.4")
+        assert b"/Type /Catalog" in raw
+        assert raw.rstrip().endswith(b"%%EOF")
+        assert data["content_text"] is None
 
     def test_report_export_requires_report_id(self) -> None:
         proxy = _build_report_proxy_with_export()

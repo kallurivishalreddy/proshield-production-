@@ -84,13 +84,27 @@ class FakeCollection:
         return type("R", (), {"matched_count": 0, "modified_count": 0})()
 
     def update_one(
-        self, query: Dict[str, Any], update: Dict[str, Any]
+        self, query: Dict[str, Any], update: Dict[str, Any],
+        upsert: bool = False,
+    ) -> Any:
+        return self._update_one_impl(query, update, upsert)
+
+    def _update_one_impl(
+        self, query: Dict[str, Any], update: Dict[str, Any],
+        upsert: bool = False,
     ) -> Any:
         for d in self.docs:
             if _match(d, query):
-                if "$set" in update:
-                    d.update(update["$set"])
+                _apply_update_ops(d, update)
                 return type("R", (), {"matched_count": 1, "modified_count": 1})()
+        if upsert:
+            doc = dict(query)
+            _apply_update_ops(doc, update, upsert=True)
+            self.docs.append(doc)
+            return type("R", (), {
+                "matched_count": 0, "modified_count": 0,
+                "upserted_id": "fake",
+            })()
         return type("R", (), {"matched_count": 0, "modified_count": 0})()
 
     def count_documents(self, query: Dict[str, Any]) -> int:
@@ -99,10 +113,43 @@ class FakeCollection:
     def create_index(self, key: List[tuple], *, name: str, unique: bool = False) -> Any:
         return name
 
+    def list_indexes(self) -> List[Dict[str, Any]]:
+        return []
+
+    def find_one_and_update(
+        self,
+        query: Dict[str, Any],
+        update: Dict[str, Any],
+        *,
+        upsert: bool = False,
+        return_document: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        # V3-5.1 fix: mutate the STORED doc, not a find_one() copy.
+        target = None
+        for stored in self.docs:
+            if _match(stored, query):
+                target = stored
+                break
+        if target is None:
+            if not upsert:
+                return None
+            target = dict(query)
+            self.docs.append(target)
+        if "$set" in update:
+            target.update(update["$set"])
+        if "$inc" in update:
+            for k, v in update["$inc"].items():
+                target[k] = int(target.get(k) or 0) + int(v)
+        return dict(target)
+
 
 class FakeCursor:
     def __init__(self, docs: List[Dict[str, Any]]) -> None:
         self.docs = docs
+
+    def limit(self, n: int) -> "FakeCursor":
+        self.docs = list(self.docs)[: max(0, int(n))]
+        return self
 
     def sort(self, key, direction: Optional[int] = None) -> "FakeCursor":
         """Support both ``sort("field", ASCENDING)`` and ``sort([("field", 1)])``."""
@@ -121,6 +168,26 @@ class FakeCursor:
 
     def __iter__(self):
         return iter(self.docs)
+
+
+def _apply_update_ops(
+    doc: Dict[str, Any], update: Dict[str, Any], *,
+    upsert: bool = False,
+) -> None:
+    """Support $set / $inc / $max / $setOnInsert on the fakes."""
+    if "$set" in update:
+        doc.update(update["$set"])
+    if "$inc" in update:
+        for k, v in update["$inc"].items():
+            doc[k] = int(doc.get(k) or 0) + int(v)
+    if "$max" in update:
+        for k, v in update["$max"].items():
+            cur = doc.get(k)
+            if cur is None or v > cur:
+                doc[k] = v
+    if "$setOnInsert" in update:
+        for k, v in update["$setOnInsert"].items():
+            doc.setdefault(k, v)
 
 
 def _match(doc: Dict[str, Any], query: Dict[str, Any]) -> bool:

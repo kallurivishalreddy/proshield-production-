@@ -108,6 +108,10 @@ def _make_metadata() -> RuleMetadata:
         category=RuleCategory.SOURCE_SPECIFIC,
         sources=("nginx",),
         event_types=("authentication_failure",),
+        # Phase 5.2: capability ownership. This rule IS the NGINX
+        # capability's detection logic, so it declares its owner rather
+        # than relying on the legacy ``sources[]`` string match.
+        capability_id="cap-nginx",
         state=RuleState.APPROVED,
         enabled=True,
         description=(

@@ -52,3 +52,33 @@ dist/
 /test_review2.txt
 /valid.txt
 
+# audit / verification scratch (root-level probe scripts, captured output, logs)
+/_cline_*
+/_aud_*
+/_clean*
+/_audit
+/_audit_*.txt
+/_audit_*.json
+/scripts/_cline_*.py
+/scripts/_audit_*.py
+
+# ------------------------------------------------------------- windows release
+# Update-channel signing material.
+#   deploy/proshield-update.pub.pem  IS tracked (it ships in every install)
+#   the private key is NEVER committed and NEVER packaged
+/deploy/signing/*.pem
+/deploy/signing/*.key
+*.pfx
+*.snk
+
+# Generated build metadata; only deploy/version.json is tracked.
+/deploy/build_info.json
+
+# Staging / PyInstaller scratch inside the release directory
+/dist/windows/*/_stage/
+/dist/windows/*/_pyinstaller/
+/dist/windows/*/build-report.json
+
+# Per-user test-mode install artefacts
+/test-install/
+

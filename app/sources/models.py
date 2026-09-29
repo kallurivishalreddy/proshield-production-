@@ -96,6 +96,16 @@ MAX_REFERENCE_LEN = 512
 MAX_ASSET_TAGS = 16
 MAX_SECRET_REF_LEN = 128
 
+# Phase 5.2 (Source Architecture 2.0) bounds. The capability id keeps
+# the Phase 5.1 ``cap-<slug>`` contract so a source can only ever
+# reference a real registry entry; the mapping-profile id keeps the
+# Phase 5.1 profile-id contract so a source can only reference a
+# profile that the owning capability actually declares.
+MAX_CAPABILITY_ID_LEN = 64
+MAX_MAPPING_PROFILE_ID_LEN = 64
+CAPABILITY_ID_RE = r"^cap-[a-z][a-z0-9-]{1,47}$"
+MAPPING_PROFILE_ID_RE = r"^[a-z][a-z0-9_-]{0,63}$"
+
 
 # ----------------------------------------------------------------- enums
 class SourceType(str, Enum):
@@ -157,6 +167,29 @@ class SourceConnectionType(str, Enum):
     PUSH = "push"
     PROXY = "proxy"
     PULL = "pull"
+
+
+class CapabilityBindingStatus(str, Enum):
+    """Phase 5.2 — how a source instance stands relative to a Capability.
+
+    * ``bound`` — the source is authoritatively attached to a real
+      Capability registry entry (``capability_id`` +
+      ``capability_version`` present). Only ``bound`` sources may be
+      validated, enabled or ingest telemetry.
+    * ``unbound`` — a freshly registered source that has not yet been
+      attached to a capability, or a legacy row that predates the
+      binding migration. No capability is claimed.
+    * ``requires_verification`` — the deterministic legacy migration
+      could not resolve a capability for this row. Per the Phase 5.0
+      freeze (§29 / §38) the row is **quarantined with an explicit
+      UNKNOWN marker** rather than being handed an invented owner:
+      ``capability_id`` stays ``None`` and the UI must show
+      "REQUIRES VERIFICATION".
+    """
+
+    BOUND = "bound"
+    UNBOUND = "unbound"
+    REQUIRES_VERIFICATION = "requires_verification"
 
 
 # ----------------------------------------------------------------- aliases
@@ -426,6 +459,43 @@ class SourceInstance(BaseModel):
     tags: Tuple[Tag, ...] = ()
     asset_tags: Tuple[AssetTag, ...] = ()
     retired_at: Optional[datetime] = None
+    # Capability patch gap 2: allocator-assigned human id
+    # (``SRC-000001``), assigned at persistence time. The technical
+    # ``source_instance_id`` stays the canonical reference.
+    human_id: Annotated[str, StringConstraints(max_length=32)] = ""
+
+    # ---- Phase 5.2 — Source Architecture 2.0: capability binding --------
+    # The source resolves to exactly one Capability (freeze §7.1 #6/#7).
+    # ``capability_id``/``capability_version`` are **server-derived**: the
+    # ingress boundary reads them from the authenticated source instance
+    # and never from the request payload (freeze §8.1). A ``None`` value
+    # is the honest "no capability claimed / unknown" state — it is never
+    # back-filled with an invented owner (freeze §29, §38).
+    capability_id: Optional[
+        Annotated[
+            str,
+            StringConstraints(
+                min_length=5,
+                max_length=MAX_CAPABILITY_ID_LEN,
+                pattern=CAPABILITY_ID_RE,
+            ),
+        ]
+    ] = None
+    capability_version: Optional[int] = None
+    mapping_profile_id: Optional[
+        Annotated[
+            str,
+            StringConstraints(
+                min_length=1,
+                max_length=MAX_MAPPING_PROFILE_ID_LEN,
+                pattern=MAPPING_PROFILE_ID_RE,
+            ),
+        ]
+    ] = None
+    capability_binding_status: CapabilityBindingStatus = (
+        CapabilityBindingStatus.UNBOUND
+    )
+    capability_bound_at: Optional[datetime] = None
 
     @field_validator("source")
     @classmethod
@@ -468,6 +538,56 @@ class SourceInstance(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_capability_binding(self) -> "SourceInstance":
+        """Enforce the Phase 5.2 binding invariants (never invent ownership).
+
+        * ``bound`` requires a capability id AND a concrete version —
+          a bound source with a dangling/absent capability would let the
+          ingress boundary stamp a capability nobody owns.
+        * ``unbound`` / ``requires_verification`` must carry **no**
+          capability id, version or mapping profile. This is the
+          machine-checked form of "Never turn missing historical truth
+          into invented historical truth" (freeze §38): a quarantined
+          legacy row cannot silently acquire an owner.
+        """
+        status = self.capability_binding_status
+        if status is CapabilityBindingStatus.BOUND:
+            if not self.capability_id:
+                raise ValueError(
+                    "bound source instances must carry capability_id"
+                )
+            if self.capability_version is None:
+                raise ValueError(
+                    "bound source instances must carry capability_version"
+                )
+            if int(self.capability_version) < 1:
+                raise ValueError("capability_version must be >= 1")
+        else:
+            if self.capability_id is not None:
+                raise ValueError(
+                    "unbound / requires_verification source instances "
+                    "must not carry capability_id"
+                )
+            if self.capability_version is not None:
+                raise ValueError(
+                    "unbound / requires_verification source instances "
+                    "must not carry capability_version"
+                )
+            if self.mapping_profile_id is not None:
+                raise ValueError(
+                    "unbound / requires_verification source instances "
+                    "must not carry mapping_profile_id"
+                )
+        if (
+            self.capability_bound_at is not None
+            and status is not CapabilityBindingStatus.BOUND
+        ):
+            raise ValueError(
+                "capability_bound_at is only valid for bound sources"
+            )
+        return self
+
     def to_view(self) -> "SourceInstanceView":
         """Return the safe view returned to clients."""
         health = SourceInstanceHealth(
@@ -481,6 +601,7 @@ class SourceInstance(BaseModel):
         )
         return SourceInstanceView(
             source_instance_id=self.source_instance_id,
+            human_id=self.human_id or "",
             source_type=self.source_type.value,
             source=self.source,
             display_name=self.display_name,
@@ -496,6 +617,11 @@ class SourceInstance(BaseModel):
             asset_tags=list(self.asset_tags),
             retired_at=self.retired_at,
             health=health,
+            capability_id=self.capability_id,
+            capability_version=self.capability_version,
+            mapping_profile_id=self.mapping_profile_id,
+            capability_binding_status=self.capability_binding_status.value,
+            capability_bound_at=self.capability_bound_at,
         )
 
     def to_canonical_dict(self) -> Dict[str, Any]:
@@ -510,6 +636,7 @@ class SourceInstance(BaseModel):
         config = self.configuration.to_safe_dict()
         return {
             "source_instance_id": self.source_instance_id,
+            "human_id": self.human_id or "",
             "source_type": self.source_type.value,
             "source": self.source,
             "display_name": self.display_name,
@@ -524,6 +651,13 @@ class SourceInstance(BaseModel):
             "tags": list(self.tags),
             "asset_tags": list(self.asset_tags),
             "retired_at": self.retired_at,
+            "capability_id": self.capability_id,
+            "capability_version": self.capability_version,
+            "mapping_profile_id": self.mapping_profile_id,
+            "capability_binding_status": (
+                self.capability_binding_status.value
+            ),
+            "capability_bound_at": self.capability_bound_at,
         }
 
 
@@ -542,6 +676,8 @@ class SourceInstanceView(BaseModel):
     )
 
     source_instance_id: SourceInstanceId
+    # Capability patch gap 2: allocator-assigned human id.
+    human_id: str = ""
     source_type: str
     source: str
     display_name: str
@@ -557,6 +693,38 @@ class SourceInstanceView(BaseModel):
     asset_tags: Tuple[str, ...]
     retired_at: Optional[datetime]
     health: SourceInstanceHealth
+    # Phase 5.2 — capability binding, exposed truthfully to the client.
+    # ``capability_binding_status`` is the string form of
+    # :class:`CapabilityBindingStatus`; the UI renders
+    # "REQUIRES VERIFICATION" from it instead of inventing an owner.
+    capability_id: Optional[str] = None
+    capability_version: Optional[int] = None
+    mapping_profile_id: Optional[str] = None
+    capability_binding_status: str = "unbound"
+    capability_bound_at: Optional[datetime] = None
+
+    @field_validator("capability_binding_status")
+    @classmethod
+    def _check_binding_status(cls, v: str) -> str:
+        if v not in {s.value for s in CapabilityBindingStatus}:
+            raise ValueError(f"unknown capability_binding_status {v!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _check_binding_view_consistency(self) -> "SourceInstanceView":
+        """The view must never claim a capability the model does not hold."""
+        bound = self.capability_binding_status == (
+            CapabilityBindingStatus.BOUND.value
+        )
+        if bound and not self.capability_id:
+            raise ValueError(
+                "bound source view must carry capability_id"
+            )
+        if not bound and self.capability_id is not None:
+            raise ValueError(
+                "non-bound source view must not carry capability_id"
+            )
+        return self
 
     @field_validator("state")
     @classmethod
@@ -605,6 +773,16 @@ class SourceIdentityToken(BaseModel):
     source_instance_id: SourceInstanceId
     source_type: str
     source: str
+    capability_id: Optional[
+        Annotated[
+            str,
+            StringConstraints(
+                min_length=5,
+                max_length=MAX_CAPABILITY_ID_LEN,
+                pattern=CAPABILITY_ID_RE,
+            ),
+        ]
+    ] = None
     issued_at: datetime
     not_before: datetime
     expires_at: datetime

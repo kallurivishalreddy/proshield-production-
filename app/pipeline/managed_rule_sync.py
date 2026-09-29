@@ -102,6 +102,16 @@ class ManagedRuleLifecycleSync:
             rule_id = metadata.rule_id
             version = metadata.version
             if (rule_id, version) in existing:
+                # 2026-09-18 audit: a row created before the shipped rule
+                # declared its capability owner keeps ``capability_id: null``
+                # forever (seeding is insert-only), so the persisted catalogue
+                # contradicts the live registry and the Rules page truthfully
+                # reports "no capability owner" for a rule the detector knows
+                # is ``cap-nginx``. Fill a MISSING owner from the shipped
+                # definition; never overwrite an owner that is already set.
+                owner = getattr(metadata, "capability_id", None)
+                if owner:
+                    self._backfill_owner(rule_id, version, owner)
                 continue
             raw_severity = getattr(metadata, "severity", "medium")
             try:
@@ -132,6 +142,12 @@ class ManagedRuleLifecycleSync:
                     state=state_value,
                     enabled=bool(getattr(metadata, "enabled", True)),
                     severity=severity,
+                    # Phase 5.2: the seeded record carries the rule's
+                    # capability ownership so the persisted catalogue and the
+                    # live evaluator agree on which capability owns the rule
+                    # (and so ``capability.list_rules`` is truthful by
+                    # ownership rather than by a source-string heuristic).
+                    capability_id=getattr(metadata, "capability_id", None),
                 )
             except Exception as exc:  # noqa: BLE001 - validation gate
                 _log.warning(
@@ -181,6 +197,36 @@ class ManagedRuleLifecycleSync:
             )
 
     # --------------------------------------------------------- internals
+    def _backfill_owner(self, rule_id: str, version: int, owner: str) -> int:
+        """Fill a missing capability owner on a persisted rule row.
+
+        Best-effort: a repository without the backfill capability (the
+        in-memory dev doubles) or a write error is logged and skipped — the
+        seeding pass must never fail because the catalogue could not be
+        reconciled. Returns 1 when a row was updated, else 0.
+        """
+        backfill = getattr(
+            self._repository, "set_capability_id_if_missing", None
+        )
+        if not callable(backfill):
+            return 0
+        try:
+            updated = backfill(rule_id, version, owner)
+        except Exception as exc:  # noqa: BLE001 - best effort
+            _log.warning(
+                "managed_rule_sync.owner_backfill_failed rule_id=%s error=%s",
+                rule_id,
+                type(exc).__name__,
+            )
+            return 0
+        if updated:
+            _log.info(
+                "managed_rule_sync.owner_backfilled rule_id=%s capability_id=%s",
+                rule_id,
+                owner,
+            )
+        return 1 if updated else 0
+
     def _management_service(self) -> Any:
         if self._service is None:
             from ..rules.management.service import RuleManagementService

@@ -149,6 +149,37 @@ class Detection(BaseModel):
     ] = ""
     detected_at: datetime
     extra: Tuple[Tuple[str, Any], ...] = ()
+    # Capability patch gap 5: the documented SeverityBand composed by
+    # the SeverityEngine at persistence time. Empty = not composed
+    # (the wire renders null; the UI renders UNRATED — never a
+    # fabricated band).
+    severity: Annotated[str, StringConstraints(max_length=32)] = ""
+    # Capability patch gap 5: the provenance pointer of the source
+    # instance that ingested the supporting event (from
+    # ``event.provenance.source_instance_id``). Empty when the event
+    # was ingested without source-management.
+    source_instance_id: Annotated[
+        str, StringConstraints(max_length=96)
+    ] = ""
+    # Capability patch gap 2: allocator-assigned human id
+    # (``DET-000001``), assigned at persistence time. Note: this field
+    # is NOT part of the ``detection_id`` derivation, so replay
+    # determinism of the technical id is untouched.
+    human_id: Annotated[str, StringConstraints(max_length=32)] = ""
+    # Phase 5.2 (§8, §12): the capability that owned the evidence this
+    # detection fired on. Stamped from the supporting SecurityEvent's
+    # **server-derived** ``provenance.capability_id`` — never from a
+    # caller-supplied field — so a detection can never claim a capability
+    # that did not actually produce the evidence. Empty means the
+    # supporting event carried no derived capability (an event ingested
+    # outside the binding-aware ingress, or pre-5.2 history); the wire
+    # renders ``null`` and the UI renders it truthfully rather than
+    # guessing. Like ``human_id`` and ``source_instance_id``, this field
+    # is NOT part of the ``detection_id`` derivation, so detection-id
+    # determinism is untouched.
+    capability_id: Annotated[
+        str, StringConstraints(max_length=64, pattern=r"^$|^cap-[a-z][a-z0-9-]{1,47}$")
+    ] = ""
 
     @property
     def evidence(self) -> List[str]:
@@ -159,12 +190,16 @@ class Detection(BaseModel):
         """JSON-ready, BSON-safe representation."""
         return {
             "detection_id": self.detection_id,
+            "human_id": self.human_id or None,
             "rule_id": self.rule_id,
             "rule_version": self.rule_version,
             "category": self.category.value,
             "event_id": self.event_id,
             "evidence_refs": list(self.evidence_refs),
             "reasoning": self.reasoning,
+            "severity": self.severity or None,
+            "source_instance_id": self.source_instance_id or None,
+            "capability_id": self.capability_id or None,
             "detected_at": self.detected_at.isoformat(),
             "extra": dict(self.extra),
         }

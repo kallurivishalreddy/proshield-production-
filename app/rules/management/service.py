@@ -456,11 +456,79 @@ class RuleManagementService:
         return len(persisted_ids)
 
     # ------------------------------------------------------------ internals
-    def _register_in_registry(self, definition: RuleDefinition) -> None:
-        """Register a single :class:`RuleDefinition` in the registry."""
+    def _implementation_for(self, definition: RuleDefinition) -> Optional[Any]:
+        """The shipped rule IMPLEMENTATION that must stay authoritative.
+
+        Returns the currently-registered rule instance for
+        ``(rule_id, version)`` when all of the following hold:
+
+        * the persisted definition declares no ``conditions`` of its own;
+        * an instance is registered (so the implementation is a rule that
+          actually ships, never an invention);
+        * it is NOT a :class:`GenericDeclarativeRule` (the declarative
+          wrapper, which carries no compiled predicate);
+        * it exposes ``with_metadata`` so it can be rebound to the persisted
+          lifecycle view.
+
+        Why this exists
+        ---------------
+        A capability-owned **library** rule is seeded into ``managed_rules``
+        as a metadata-only definition (``conditions=None``), because a Python
+        predicate cannot be transcribed into the bounded declarative DSL.
+        Re-registering such a definition as a declarative wrapper would
+        silently discard the predicate: the rule would then match on
+        applicability metadata alone — e.g. every ``request_blocked`` event
+        would fire all three ``request_blocked`` rules regardless of status
+        code or path, and a forged ``authentication_failure`` with any status
+        would fire the 401 rule. Returning the implementation keeps the
+        shipped detection logic authoritative while the operator-visible
+        lifecycle state (``enabled`` / ``state`` / name / tags) still comes
+        from the store.
+
+        A definition that *does* declare its own conditions (an
+        operator-authored or operator-edited rule) returns ``None``: the
+        explicit declarative logic is authoritative and wins.
+        """
+        if definition.conditions is not None:
+            return None
+        existing = self._registry.get(definition.rule_id, definition.version)
+        if existing is None or isinstance(existing, GenericDeclarativeRule):
+            return None
+        if not callable(getattr(existing, "with_metadata", None)):
+            return None
+        return existing
+
+    def _register_in_registry(
+        self,
+        definition: RuleDefinition,
+        *,
+        implementation: Optional[Any] = None,
+    ) -> None:
+        """Register a single :class:`RuleDefinition` in the registry.
+
+        ``implementation`` (optional) is a shipped rule instance whose logic
+        must be preserved; it is rebound to ``definition``'s metadata via
+        :meth:`with_metadata`. Any rebind failure falls back to the
+        declarative wrapper (logged, never blocking the registry update).
+        """
         if definition.state == STATE_RETIRED:
             return
-        rule = GenericDeclarativeRule(definition)
+        rule: Optional[Any] = None
+        if implementation is not None:
+            try:
+                rule = implementation.with_metadata(definition.to_metadata())
+            except Exception as exc:  # noqa: BLE001 - fall back, never block
+                _log.warning(
+                    "rule_management.implementation_rebind_failed",
+                    extra={
+                        "rule_id": definition.rule_id,
+                        "version": definition.version,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                rule = None
+        if rule is None:
+            rule = GenericDeclarativeRule(definition)
         try:
             self._registry.register(rule)
         except DuplicateRuleError as exc:
@@ -480,10 +548,18 @@ class RuleManagementService:
     def _reregister_in_registry(
         self, definition: RuleDefinition
     ) -> None:
-        """Replace the registry entry for ``(rule_id, version)``."""
+        """Replace the registry entry for ``(rule_id, version)``.
+
+        A capability-owned library rule keeps its shipped implementation
+        (see :meth:`_implementation_for`) while its persisted lifecycle state
+        (enable / disable / retire) is honoured.
+        """
+        implementation = self._implementation_for(definition)
         self._safe_unregister(definition.rule_id, definition.version)
         if definition.state != STATE_RETIRED:
-            self._register_in_registry(definition)
+            self._register_in_registry(
+                definition, implementation=implementation
+            )
 
     def _unregister_from_registry(
         self, rule_id: str, version: int

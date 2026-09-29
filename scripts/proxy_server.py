@@ -79,6 +79,12 @@ from app.rules.management.service import RuleManagementService
 from app.reports.service import ReportService
 from app.incidents.service import IncidentService
 from app.incidents.repository import IncidentRepository
+from app.notifications import (
+    NotificationRepository,
+    NotificationService,
+)
+from app.observability.health import DeepHealthService
+from app.persistence.telemetry import SourceTelemetryStore
 from app.reports.repository import ReportRepository
 from app.routing import RoutingEngine
 
@@ -146,6 +152,38 @@ class FakeCollection:
 
     def count_documents(self, query: Dict[str, Any]) -> int:
         return sum(1 for d in self.docs if _match(d, query))
+
+    def find_one_and_update(
+        self,
+        query: Dict[str, Any],
+        update: Dict[str, Any],
+        *,
+        upsert: bool = False,
+        return_document: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        # V3-5.1 fix: mutate the STORED doc, not a find_one() copy.
+        # The previous version updated a detached dict, so counter
+        # $inc never persisted and every HumanIdAllocator.allocate()
+        # returned xxx-000001 on this backend.
+        target = None
+        for stored in self.docs:
+            if _match(stored, query):
+                target = stored
+                break
+        if target is None:
+            if not upsert:
+                return None
+            target = dict(query)
+            self.docs.append(target)
+        if "$set" in update:
+            target.update(update["$set"])
+        if "$inc" in update:
+            for k, v in update["$inc"].items():
+                target[k] = int(target.get(k) or 0) + int(v)
+        return dict(target)
+
+    def list_indexes(self) -> List[Dict[str, Any]]:
+        return []
 
     def create_index(
         self, key: List[Tuple[str, int]], *, name: str, unique: bool = False
@@ -443,6 +481,7 @@ class _BackendBundle:
         detection_repo: DetectionRepository,
         correlation_repo: CorrelationRepository,
         event_repo: SecurityEventRepository,
+        notification_service: Optional[Any] = None,
     ) -> None:
         self.config = config
         self.proxy = proxy
@@ -455,6 +494,7 @@ class _BackendBundle:
         self.detection_repo = detection_repo
         self.correlation_repo = correlation_repo
         self.event_repo = event_repo
+        self.notification_service = notification_service
         self.rule_repo_for_test: Optional[RuleRepository] = None
 
 
@@ -501,15 +541,174 @@ def _attach_services(proxy: SecureProxy, bundle: _BackendBundle) -> None:
     # NGINX rules (and so any later ``rule.create`` knows about them).
     _seed_managed_rules(rule_repo, bundle.rule_registry)
 
-    proxy.attach_rule_management_service(
-        RuleManagementService(
-            repository=rule_repo,
-            registry=bundle.rule_registry,
+    rule_service = RuleManagementService(
+        repository=rule_repo,
+        registry=bundle.rule_registry,
+        config=bundle.config,
+    )
+    proxy.attach_rule_management_service(rule_service)
+
+    proxy.attach_report_service(bundle.report_service)
+
+    # ------------------------------------------------------------------
+    # Phase 5.1 capability registry.
+    # ------------------------------------------------------------------
+    from app.capabilities.registry import CapabilityRegistry
+    from app.capabilities.repository import CapabilityRepository
+    from app.capabilities.service import CapabilityService
+
+    _capability_db = getattr(bundle.detection_repo, "_db", None)
+    capability_db = _capability_db if _capability_db is not None else FakeDatabase()
+    capability_service = CapabilityService(
+        repository=CapabilityRepository(db=capability_db, config=bundle.config),
+        registry=CapabilityRegistry(),
+        source_service=bundle.source_management,
+        rule_service=rule_service,
+    )
+    try:
+        capability_service.reload_from_repository()
+    except Exception as exc:  # pragma: no cover - best effort
+        LOGGER.warning("capability registry recovery failed: %s", exc)
+    try:
+        seed_summary = capability_service.seed_builtins(actor="system")
+        LOGGER.info("capability bootstrap seeded %s", seed_summary)
+    except Exception as exc:  # pragma: no cover - best effort
+        LOGGER.warning("capability bootstrap seed failed: %s", exc)
+    if bundle.backend_kind == "mongo":
+        try:
+            capability_service.repository.ensure_schema()
+            capability_service.repository.ensure_indexes()
+        except Exception as exc:  # pragma: no cover - bootstrap already applied
+            LOGGER.warning("capability schema ensure failed: %s", exc)
+    proxy.attach_capability_service(capability_service)
+    bundle.capability_service = capability_service  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------
+    # Phase 5.2 — Source Architecture 2.0.
+    #
+    # The capability registry above is now the authoritative binding
+    # authority for the source layer (the shipped-seed fallback only
+    # applies where no registry is wired). The source audit collection and
+    # the legacy-migration engine are attached here so every source
+    # binding / lifecycle / token write is auditable and the one-time
+    # backfill is observable through ``source.migration_status``.
+    # ------------------------------------------------------------------
+    if capability_db is not None and bundle.backend_kind == "mongo":
+        try:
+            source_repo = getattr(
+                bundle.source_management, "_repository", None
+            )
+            if source_repo is not None:
+                source_repo.ensure_audit_schema()
+                source_repo.ensure_audit_indexes()
+                bundle.source_management.set_audit_collection(
+                    source_repo.audit_collection()
+                )
+        except Exception as exc:  # pragma: no cover - bootstrap already applied
+            LOGGER.warning("source audit schema ensure failed: %s", exc)
+
+    try:
+        bundle.source_management.set_capability_lookup(
+            capability_service.get
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        LOGGER.warning("capability lookup wiring failed: %s", exc)
+
+    _wire_source_capability_migration(
+        bundle, proxy, capability_db, capability_service, LOGGER
+    )
+
+    # ------------------------------------------------------------------
+    # Capability patch services (gaps 8, 9, 12).
+    # ------------------------------------------------------------------
+    db = getattr(bundle.detection_repo, "_db", None)
+
+    if bundle.notification_service is not None:
+        if bundle.backend_kind == "mongo":
+            bundle.notification_service.repository.ensure_schema()
+            bundle.notification_service.repository.ensure_indexes()
+        proxy.attach_notification_service(bundle.notification_service)
+
+    telemetry_store = None
+    if db is not None and bundle.backend_kind == "mongo":
+        telemetry_store = SourceTelemetryStore(db=db, config=bundle.config)
+        telemetry_store.ensure_ready()
+        proxy.attach_source_telemetry(telemetry_store)
+
+    proxy.attach_deep_health_service(
+        DeepHealthService(
+            db=db,
             config=bundle.config,
+            backend_kind=bundle.backend_kind,
+            rule_registry=bundle.rule_registry,
+            incident_service=bundle.incident_service,
+            correlation_service=correlation_service,
+            detection_service=detection_service,
+            source_management_service=bundle.source_management,
+            telemetry_store=telemetry_store,
+            capability_service=getattr(bundle, "capability_service", None),
         )
     )
 
-    proxy.attach_report_service(bundle.report_service)
+
+def _wire_source_capability_migration(  # noqa: ANN001
+    bundle, proxy, db, capability_service, logger,
+) -> None:
+    """Construct + attach the Phase 5.2 legacy capability migration.
+
+    The engine is constructed with the source repository, the capability
+    registry lookup (as the binding authority) and the live source
+    registry, then attached to the proxy so ``source.migration_status``
+    (read-only dry run) and ``source.migrate`` (admin apply) are real.
+
+    The migration is deliberately *not* applied automatically here: a
+    backfill on every boot would be a silent, restart-sensitive state
+    change. The documented startup path applies it explicitly (dry run
+    first) so the operator sees the exact plan before anything is written.
+    Failure to construct the engine is logged loudly rather than swallowed,
+    because the wire ops must never degrade into a fake "0 changes".
+    """
+    from app.sources.migration import SourceCapabilityMigration
+
+    source_repo = getattr(bundle.source_management, "_repository", None)
+    if source_repo is None:
+        logger.warning(
+            "source capability migration not wired: source repository "
+            "unavailable"
+        )
+        return
+    try:
+        audit_collection = None
+        if db is not None:
+            try:
+                audit_collection = source_repo.audit_collection()
+            except Exception:  # noqa: BLE001 - memory backend
+                audit_collection = None
+        capability_audit = getattr(
+            getattr(capability_service, "repository", None),
+            "_audit",
+            None,
+        )
+        rule_repo = getattr(
+            getattr(bundle, "rule_service", None), "_repository", None
+        )
+        if rule_repo is None:
+            rule_repo = getattr(bundle, "rule_repository", None)
+        engine = SourceCapabilityMigration(
+            source_repository=source_repo,
+            capability_lookup=capability_service.get,
+            registry=getattr(bundle.source_management, "_registry", None),
+            rule_repository=rule_repo,
+            capability_audit_collection=capability_audit,
+        )
+        proxy.attach_source_capability_migration(
+            engine, audit_collection=audit_collection
+        )
+        logger.info("source capability migration engine wired (Phase 5.2)")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "source capability migration wiring failed: %s", exc
+        )
 
 
 def _mongo_db_for_collection(coll_name: str, bundle: _BackendBundle):  # noqa: ANN001
@@ -603,6 +802,13 @@ def _seed_managed_rules(
                 state=state_value,
                 enabled=bool(getattr(metadata, "enabled", True)),
                 severity=severity,
+                # Phase 5.2 (2026-09-18 audit): the seeded record must carry
+                # the rule's capability ownership, otherwise the persisted
+                # catalogue is ownerless and every reconciliation
+                # (``reload_registry``) rebinds the live rule without its
+                # owner — leaving the Rules page deriving a pseudo-owner and
+                # the persisted/live ownership views inconsistent.
+                capability_id=getattr(metadata, "capability_id", None),
             )
         except Exception as exc:  # pragma: no cover - validation gate
             LOGGER.warning(
@@ -699,7 +905,13 @@ def _build_memory_backend(config: ProShieldConfig) -> _BackendBundle:
     correlation_repo = CorrelationRepository(db=db, config=config)
     event_repo = SecurityEventRepository(db=db, config=config)
     incident_repo = IncidentRepository(db=db, config=config)
-    incident_service = IncidentService(repository=incident_repo)
+    notification_service = NotificationService(
+        repository=NotificationRepository(db=db, config=config),
+    )
+    incident_service = IncidentService(
+        repository=incident_repo,
+        notification_sink=notification_service.sink,
+    )
 
     report_repo = ReportRepository(db=db, config=config)
     report_service = ReportService(
@@ -719,6 +931,7 @@ def _build_memory_backend(config: ProShieldConfig) -> _BackendBundle:
         detection_repo=detection_repo,
         correlation_repo=correlation_repo,
         event_repo=event_repo,
+        notification_service=notification_service,
     )
     bundle._mongo_db = None  # type: ignore[attr-defined]
     _attach_services(proxy, bundle)
@@ -828,7 +1041,13 @@ def _build_mongo_backend(config: ProShieldConfig) -> _BackendBundle:
     correlation_repo = CorrelationRepository(db=db, config=config)
     event_repo = SecurityEventRepository(db=db, config=config)
     incident_repo = IncidentRepository(db=db, config=config)
-    incident_service = IncidentService(repository=incident_repo)
+    notification_service = NotificationService(
+        repository=NotificationRepository(db=db, config=config),
+    )
+    incident_service = IncidentService(
+        repository=incident_repo,
+        notification_sink=notification_service.sink,
+    )
 
     report_repo = ReportRepository(db=db, config=config)
     report_service = ReportService(
@@ -848,6 +1067,7 @@ def _build_mongo_backend(config: ProShieldConfig) -> _BackendBundle:
         detection_repo=detection_repo,
         correlation_repo=correlation_repo,
         event_repo=event_repo,
+        notification_service=notification_service,
     )
     bundle._mongo_db = db  # type: ignore[attr-defined]
     _attach_services(proxy, bundle)

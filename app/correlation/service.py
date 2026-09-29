@@ -63,6 +63,19 @@ class CorrelationReadService:
     def repository(self) -> "CorrelationRepository":
         return self._repository
 
+    def list_patterns(self) -> List[Dict[str, Any]]:
+        """Return descriptors of every registered correlation pattern.
+
+        Capability patch gap 7: the pattern ids were previously
+        undiscoverable on the wire (the frontend hardcoded the one id
+        it knew). This serves the LIVE catalogue from the registered
+        pattern classes — never a frontend copy. Idempotent,
+        read-only, bounded by the catalogue itself.
+        """
+        from .patterns import describe_registered_patterns
+
+        return describe_registered_patterns()
+
     def list(
         self,
         *,

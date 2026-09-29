@@ -160,6 +160,21 @@ class RuleDefinition(BaseModel):
     )
     tags: Tuple[str, ...] = Field(default_factory=tuple)
     references: Tuple[str, ...] = Field(default_factory=tuple)
+    # --- Phase 5.2 capability ownership (dual-read during migration) -----
+    # When set, this rule is owned by a Capability and the detection engine
+    # resolves applicability through the event's **server-derived**
+    # capability id rather than the legacy ``sources[]`` string match
+    # (master plan §19: "rule.capability_id authoritative; dual-read during
+    # migration, capability wins"). ``None`` is the honest "legacy rule,
+    # not yet bound" state and keeps the Phase 4 string-matching behaviour
+    # byte-identical.
+    capability_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Phase 5.2 capability ownership (``cap-<slug>``). None = "
+            "legacy rule resolved by sources[] string match."
+        ),
+    )
     # --- logic
     combinator: ConditionCombinator = ConditionCombinator.AND
     conditions: Optional[Expression] = None
@@ -441,6 +456,7 @@ class RuleDefinition(BaseModel):
             references=self.references,
             state=state,
             enabled=self.enabled,
+            capability_id=self.capability_id,
         )
 
     def to_canonical_dict(self) -> Dict[str, Any]:
@@ -464,6 +480,10 @@ class RuleDefinition(BaseModel):
             "severity": self.severity.value,
             "sources": list(self.sources),
             "event_types": list(self.event_types),
+            # Phase 5.2: capability ownership. Persisted as an explicit
+            # ``null`` for a legacy rule — the honest "not yet bound"
+            # state, never a fabricated id (freeze §38).
+            "capability_id": self.capability_id,
             "tags": list(self.tags),
             "references": list(self.references),
             "combinator": self.combinator.value,

@@ -85,6 +85,7 @@ from ..domain.errors import (
     PersistenceError,
     ValidationError,
 )
+from .human_ids import COUNTERS_COLLECTION, HumanIdAllocator
 
 
 # ----------------------------------------------------------------- index specs
@@ -97,6 +98,8 @@ INDEX_SPECS: List[Dict[str, Any]] = [
     {"name": "det_rule_id", "key": [("rule_id", ASCENDING), ("rule_version", ASCENDING)]},
     {"name": "det_event_id", "key": [("event_id", ASCENDING)]},
     {"name": "det_detected_at_desc", "key": [("detected_at", DESCENDING)]},
+    # Phase 5.2 (§12): capability-scoped detection lookup.
+    {"name": "det_capability_id", "key": [("capability_id", ASCENDING)]},
 ]
 
 
@@ -152,6 +155,27 @@ DETECTIONS_VALIDATOR: Dict[str, Any] = {
             "detected_at": {"bsonType": "date"},
             "extra": {"bsonType": "object"},
             "correlated": {"bsonType": "bool"},
+            # Capability patch gaps 2+5: human id, composed severity
+            # band and source provenance pointer. Optional (null for
+            # legacy rows) — never fabricated.
+            "severity": {
+                "bsonType": ["string", "null"], "maxLength": 32,
+            },
+            "source_instance_id": {
+                "bsonType": ["string", "null"], "maxLength": 96,
+            },
+            "human_id": {
+                "bsonType": ["string", "null"], "maxLength": 32,
+            },
+            # Phase 5.2 (§8/§12): the server-derived capability that owned
+            # the evidence this detection fired on. Optional/null for
+            # pre-5.2 rows and for events ingested outside the
+            # binding-aware ingress — never fabricated.
+            "capability_id": {
+                "bsonType": ["string", "null"],
+                "maxLength": 64,
+                "pattern": r"^$|^cap-[a-z][a-z0-9-]{1,47}$",
+            },
         },
     }
 }
@@ -177,6 +201,13 @@ class DetectionRepository:
         self._config = config
         self._collection_name: str = detection_collection_name(config)
         self._collection: Collection = db[self._collection_name]
+        # Capability patch gap 2: creation-time human-id assignment
+        # (atomic counter on real MongoDB; monotonic fallback for the
+        # in-memory fakes).
+        counters = db[COUNTERS_COLLECTION]
+        if not hasattr(counters, "find_one_and_update"):
+            counters = None
+        self._human_ids = HumanIdAllocator(counters, "detection")
 
     # ------------------------------------------------------------- infrastructure
     def ensure_schema(self) -> None:
@@ -245,6 +276,10 @@ class DetectionRepository:
             raise ValidationError(
                 safe_message="create() requires a Detection",
                 internal_detail=f"got {type(detection).__name__}",
+            )
+        if not detection.human_id:
+            detection = detection.model_copy(
+                update={"human_id": self._human_ids.allocate()},
             )
         try:
             payload = detection.to_dict()
@@ -520,6 +555,61 @@ class DetectionRepository:
                 ),
             ) from exc
 
+    def find_since(
+        self,
+        since: datetime,
+        *,
+        until: Optional[datetime] = None,
+        limit: int = 5000,
+    ) -> List[Detection]:
+        """Detections in a bounded time window (capability patch gap 15).
+
+        The server-side time-series aggregate reads through this
+        bounded query (``det_detected_at_desc`` index on real
+        pymongo). The in-memory fakes fall back to a filtered scan —
+        the same bounded result contract.
+        """
+        from datetime import timezone as _tz
+
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=_tz.utc)
+        bounded = max(1, min(int(limit), 5000))
+        try:
+            from pymongo.collection import Collection as _PC
+
+            if isinstance(self._collection, _PC):
+                query: Dict[str, Any] = {"detected_at": {"$gte": since}}
+                if until is not None:
+                    if until.tzinfo is None:
+                        until = until.replace(tzinfo=_tz.utc)
+                    query["detected_at"]["$lte"] = until
+                docs = list(
+                    self._collection.find(query)
+                    .sort("detected_at", 1)
+                    .limit(bounded)
+                )
+            else:
+                kept = []
+                for doc in self._collection.find({}):
+                    ts = _doc_detected_at_ts(doc)
+                    if ts is None or ts < since:
+                        continue
+                    if until is not None:
+                        u = until if until.tzinfo else until.replace(
+                            tzinfo=_tz.utc
+                        )
+                        if ts > u:
+                            continue
+                    kept.append(doc)
+                kept.sort(key=_doc_detected_at_ts)
+                docs = kept[:bounded]
+        except PyMongoError as exc:
+            raise PersistenceError(
+                safe_message="could not list detections in window",
+                internal_detail=f"find failed: {type(exc).__name__}",
+            ) from exc
+        return [_document_to_detection(d) for d in docs]
+
 
 # ----------------------------------------------------------------- helpers
 def _document_to_detection(doc: Dict[str, Any]) -> Detection:
@@ -539,6 +629,11 @@ def _document_to_detection(doc: Dict[str, Any]) -> Detection:
         for k, v in doc.items()
         if k not in ("_id", "correlated")
     }
+    # Capability patch gaps 2+5: the wire-friendly None written by
+    # to_dict() round-trips back to the model's "" default.
+    for blank_field in ("severity", "source_instance_id", "human_id", "capability_id"):
+        if cleaned.get(blank_field) is None:
+            cleaned[blank_field] = ""
     if "extra" in cleaned and isinstance(cleaned["extra"], dict):
         cleaned["extra"] = tuple(sorted(cleaned["extra"].items()))
     if "detected_at" in cleaned and isinstance(

@@ -124,6 +124,15 @@ SECURITY_EVENTS_VALIDATOR: Dict[str, Any] = {
                             r"(-[a-z0-9][a-z0-9-]{0,32})?$"
                         ),
                     },
+                    # Phase 5.2: capability derived server-side from the
+                    # authenticated SourceInstance and stamped by the
+                    # ingress boundary. Never taken from the payload.
+                    "capability_id": {
+                        "bsonType": ["string", "null"],
+                        "minLength": 5,
+                        "maxLength": 64,
+                        "pattern": r"^cap-[a-z][a-z0-9-]{1,47}$",
+                    },
                 },
             },
             "schema_version": {

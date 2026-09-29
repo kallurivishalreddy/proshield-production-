@@ -21,10 +21,20 @@ Security controls (documented in the report):
 
 * Token verification: missing / malformed / expired /
   tampered tokens are rejected with safe 4xx responses.
-* Source integrity: the inbound payload's
+* Source integrity: the **signed token's**
   ``(source_instance_id, source_type, source)`` triple must
   match the registered source instance. A mismatch is a
-  ``SourceIntegrityError`` (403).
+  ``SourceIntegrityError`` (403). This is the documented
+  Phase 4.9 contract and it is enforced below, before any event is
+  built.
+* Derived provenance: identity fields carried *inside* an event
+  (``source``, ``source_instance_id``, ``capability_id``,
+  ``provenance``, ``ingested_at``) are **not** part of the event
+  contract and are never trusted — the canonical event is stamped from
+  the authenticated source instance, so a declaration that disagrees
+  with the token is ignored (rewritten to the token identity) rather
+  than accepted. Ownership is therefore always the token owner; the
+  wire declaration never becomes trusted provenance.
 * State enforcement: only ``ENABLED`` source instances are
   accepted. ``DISABLED`` / ``RETIRED`` instances return
   documented errors.
@@ -43,6 +53,8 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
+
+from pydantic import ValidationError as PydanticValidationError
 
 from ..config import ProShieldConfig
 from ..domain.errors import (
@@ -271,16 +283,41 @@ class InboundIngressProxy:
         token_verifier: SourceIdentityTokenVerifier,
         ingestion_service: SecurityEventIngestionService,
         authoritative_source_resolver: Optional[Any] = None,
+        telemetry_recorder: Optional[Any] = None,
     ) -> None:
         self._config = config
         self._registry = registry
         self._token_verifier = token_verifier
         self._ingestion_service = ingestion_service
         self._authoritative_resolver = authoritative_source_resolver
+        # Capability patch gap 9: optional per-source telemetry recorder
+        # (a SourceTelemetryStore). Counters live at the ingress
+        # boundary because that is the layer that accepts or rejects
+        # source telemetry. Failure to record is observable (logged)
+        # but never blocks the ingest itself.
+        self._telemetry_recorder = telemetry_recorder
         self._rate_limiter = _RateLimiter(
             window_seconds=60,
             budget=config.ingress_rate_limit_per_minute,
         )
+
+    def _telemetry(self, kind: str, source_instance_id: str, **kw: Any) -> None:
+        """Best-effort telemetry recording; never blocks the ingest."""
+        if self._telemetry_recorder is None:
+            return
+        try:
+            getattr(self._telemetry_recorder, kind)(
+                source_instance_id, **kw,
+            )
+        except Exception as exc:  # noqa: BLE001 - observable, not fatal
+            _log.warning(
+                "ingress.telemetry_failed",
+                extra={
+                    "kind": kind,
+                    "source_instance_id": source_instance_id,
+                    "error_type": type(exc).__name__,
+                },
+            )
 
     def handle(self, request: IngressRequest) -> IngressResponse:
         """Dispatch a single inbound request."""
@@ -392,6 +429,27 @@ class InboundIngressProxy:
                 "registered source instance",
                 status=403,
             )
+        # Phase 5.2: capability quarantine gate. A source whose capability
+        # could not be resolved by the legacy migration is explicitly marked
+        # REQUIRES VERIFICATION and may not ingest at all — accepting its
+        # telemetry would produce events whose capability provenance the
+        # platform cannot honestly state (freeze §29/§38).
+        binding_status = _binding_status_of(source)
+        if binding_status == "requires_verification":
+            return _error_response(
+                "source_capability_unverified",
+                (
+                    "source instance capability binding requires "
+                    "verification; ingestion is blocked until an "
+                    "administrator binds a capability"
+                ),
+                status=409,
+            )
+        # Phase 5.2: derive the capability from the authenticated source
+        # instance. This is the ONLY source of ``capability_id`` for the
+        # canonical event; any ``capability_id`` present in the request body
+        # is ignored (never trusted as authoritative).
+        derived_capability_id = _capability_id_of(source)
         now = datetime.now(timezone.utc).timestamp()
         # ST-01: count events against the per-source budget
         # so a single request carrying N events cannot amplify
@@ -442,38 +500,67 @@ class InboundIngressProxy:
             )
         accepted: List[str] = []
         rejected: List[Dict[str, Any]] = []
+        if events_raw:
+            # Count events OFFERED (accepted + rejected) — gap 9.
+            self._telemetry(
+                "record_received", verified.source_instance_id,
+                count=len(events_raw),
+            )
         for raw in events_raw:
             if not isinstance(raw, dict):
                 rejected.append({
                     "reason": "not-a-dict",
                     "raw_type": type(raw).__name__,
                 })
+                self._telemetry(
+                    "record_rejected", verified.source_instance_id,
+                    count=1,
+                )
                 continue
             try:
                 ev = self._build_security_event(
                     raw, source=source,
+                    capability_id=derived_capability_id,
                 )
                 persisted = self._ingestion_service.ingest(ev)
                 accepted.append(persisted.event_id)
+                self._telemetry(
+                    "record_accepted", verified.source_instance_id,
+                    count=1,
+                )
             except DomainError as exc:
                 rejected.append({
                     "reason": exc.code,
                     "message": exc.safe_message,
                 })
+                self._telemetry(
+                    "record_rejected", verified.source_instance_id,
+                    count=1, message=exc.safe_message,
+                )
             except Exception as exc:  # noqa: BLE001
+                # Observability (2026-09-18 audit): an unexpected (non-domain)
+                # failure was previously logged with only a static event name
+                # and an ``extra`` field the deployment formatter never
+                # rendered, so an operator saw "ingest_failed" on the wire and
+                # *nothing* actionable in the log. The exception type and its
+                # bounded message are now part of the message itself. No raw
+                # telemetry is logged — only the exception class and text.
                 _log.warning(
-                    "ingress.event.unexpected",
-                    extra={
-                        "source_instance_id": (
-                            verified.source_instance_id
-                        ),
-                        "error_type": type(exc).__name__,
-                    },
+                    "ingress.event.unexpected source_instance_id=%s "
+                    "error_type=%s error=%s",
+                    verified.source_instance_id,
+                    type(exc).__name__,
+                    str(exc)[:300],
                 )
                 rejected.append({
                     "reason": "ingest_failed",
                     "message": "event rejected by ingestion service",
+                    "error_type": type(exc).__name__,
                 })
+                self._telemetry(
+                    "record_error", verified.source_instance_id,
+                    message="ingest_failed",
+                )
         return IngressResponse(
             status=200,
             body={
@@ -520,6 +607,52 @@ class InboundIngressProxy:
         raw: Dict[str, Any],
         *,
         source: SourceInstance,
+        capability_id: Optional[str] = None,
+    ) -> SecurityEvent:
+        """Build the canonical event, translating model failures truthfully.
+
+        Any Pydantic failure raised while shaping the canonical event (an
+        invalid ``event_id``, a clock-skewed/!parseable ``event_time``, an
+        out-of-bounds provenance field, ...) is translated into the documented
+        domain :class:`~app.domain.errors.ValidationError`.
+
+        2026-09-18 audit (AUD-CL-03): before this wrapper such a failure
+        escaped as a bare Pydantic error, was caught by the ingress's generic
+        ``except Exception`` handler and reached the source as the opaque
+        reason ``ingest_failed`` with the wire body still claiming
+        ``ok: true``. The documented contract requires a truthful per-event
+        reason, and ``validation_error`` is that reason — the operator also
+        gets a bounded diagnostic in the server log.
+        """
+        try:
+            return self._build_security_event_inner(
+                raw, source=source, capability_id=capability_id,
+            )
+        except PydanticValidationError as exc:
+            _log.warning(
+                "ingress.event.canonical_validation_failed "
+                "source_instance_id=%s errors=%d detail=%s",
+                getattr(source, "source_instance_id", "?"),
+                len(exc.errors()),
+                str(exc)[:300],
+            )
+            raise DomainValidationError(
+                safe_message="event failed canonical validation",
+                internal_detail=(
+                    f"pydantic raised {len(exc.errors())} error(s); "
+                    f"first={str(exc)[:200]}"
+                ),
+                field="event",
+                code="validation_error",
+                http_status=400,
+            ) from exc
+
+    def _build_security_event_inner(
+        self,
+        raw: Dict[str, Any],
+        *,
+        source: SourceInstance,
+        capability_id: Optional[str] = None,
     ) -> SecurityEvent:
         if not isinstance(raw, dict):
             raise DomainValidationError(
@@ -559,7 +692,29 @@ class InboundIngressProxy:
         elif isinstance(event_time_raw, datetime):
             et = event_time_raw
         else:
-            et = datetime.now(timezone.utc)
+            # Batch 1/2 T22 fix: ``event_time`` is a REQUIRED canonical field
+            # ("when the source says the event occurred") and is explicitly
+            # documented as distinct from ``ingested_at`` ("when ProShield
+            # received it") — the difference reveals source/network delay and
+            # buffering (Phase 2 SECURITY_EVENT_SCHEMA §5.2 / §16,
+            # CONTRACT_DECISIONS). The boundary previously stamped a missing /
+            # null / wrongly-typed field with the server receive clock, which
+            # fabricated the source's observation time and collapsed the two
+            # timestamps into one. Reproduced live: payloads carrying
+            # ``event_time: 1234567890``, ``null`` or no canonical timestamp at
+            # all (e.g. only a non-canonical ``timestamp`` key) were accepted
+            # with ``event_time == ingested_at``. The malformed-string case is
+            # already rejected below, so this restores one consistent,
+            # fail-closed contract: a non-timestamp is a validation error and
+            # is reported per event.
+            raise DomainValidationError(
+                safe_message="event_time missing or not a timestamp",
+                internal_detail=(
+                    f"got {type(event_time_raw).__name__}"
+                ),
+                code="validation_error",
+                http_status=400,
+            )
         if et.tzinfo is None:
             et = et.replace(tzinfo=timezone.utc)
         provenance = SecurityEventProvenance(
@@ -570,6 +725,12 @@ class InboundIngressProxy:
                 or f"ingress-{uuid7()}"
             )[:256],
             source_instance_id=source.source_instance_id,
+            # Phase 5.2: the capability is *derived* from the authenticated
+            # source instance, never read from the payload. ``capability_id``
+            # is the value the caller passed to this method, and the caller
+            # (``_handle_ingest``) obtained it from the source record the
+            # token authenticated.
+            capability_id=capability_id,
         )
         account = None
         account_raw = raw.get("account")
@@ -582,32 +743,57 @@ class InboundIngressProxy:
         details = raw.get("details") or {}
         if not isinstance(details, dict):
             details = {"_raw_details": str(details)[:256]}
-        # ST-04 remediation: source-reported identity is
-        # untrusted. The wire endpoint / asset / source_ip
-        # are stamped onto the event ONLY when they match
-        # the registered source configuration; mismatches
-        # are recorded under ``details._untrusted_*`` and
-        # NOT promoted to canonical SecurityEvent fields.
+        # Trust boundary — corrected by the 2026-09-18 baseline audit.
+        #
+        # What a source may NOT do is *self-declare its own identity or
+        # capability*. That is enforced here: the canonical ``source``,
+        # ``provenance.collector``, ``provenance.source_instance_id`` and
+        # ``provenance.capability_id`` are stamped from the authenticated
+        # token/source record, and a payload-supplied value is ignored.
+        #
+        # ``endpoint`` and ``asset`` are NOT identity — they are
+        # *observations* the authenticated source reports about the traffic it
+        # proxied: the same class of field as ``source_ip`` (see the V2-19 note
+        # below) and exactly what the canonical contract defines
+        # (SECURITY_EVENT_SCHEMA §6.3: "Application/service endpoint involved in
+        # the event", e.g. ``/login``; the NGINX connector maps it from
+        # ``record.path``). Discarding them and substituting the source's
+        # *connection* endpoint (``configuration.endpoint`` — the collector /
+        # webhook URL) made the NGINX capability's per-event rules unreachable
+        # (sensitive-path 4xx, 401/403 on auth-shaped endpoints), keyed every
+        # brute-force correlation on the webhook URL instead of the attacked
+        # path, and falsified the analyst-facing evidence.
+        #
+        # The disagreement between the registered configuration and the
+        # observed value is still recorded for the operator (a real
+        # misconfiguration signal), but it never removes the observation.
         registered_endpoint = (
             source.configuration.endpoint or None
         )
         client_endpoint = _opt_str(raw.get("endpoint"), 512)
-        reconciled_endpoint = (
-            client_endpoint
-            if client_endpoint is not None
-            and client_endpoint == registered_endpoint
+        endpoint = (
+            client_endpoint if client_endpoint is not None
             else registered_endpoint
         )
+        if (
+            client_endpoint is not None
+            and registered_endpoint is not None
+            and client_endpoint != registered_endpoint
+        ):
+            details["_registered_endpoint"] = registered_endpoint
         registered_asset = (
             source.asset_tags[0] if source.asset_tags else None
         )
         client_asset = _opt_str(raw.get("asset"), 128)
-        reconciled_asset = (
-            client_asset
-            if client_asset is not None
-            and client_asset == registered_asset
-            else registered_asset
+        asset = (
+            client_asset if client_asset is not None else registered_asset
         )
+        if (
+            client_asset is not None
+            and registered_asset is not None
+            and client_asset != registered_asset
+        ):
+            details["_registered_asset"] = registered_asset
         client_source_ip = _opt_str(raw.get("source_ip"), 64)
         # V2-19 fix: ``source_ip`` is the *attacker* attribution field
         # observed by the authenticated external source — it does not
@@ -619,16 +805,9 @@ class InboundIngressProxy:
         # by ``source_ip`` (BruteForceClusteringPattern) for realistic
         # telemetry whose wire path differs from the configured one —
         # a systematic false-negative. The endpoint mismatch itself is
-        # still recorded under ``details._untrusted_endpoint`` for the
-        # analyst; the attacker IP is preserved as evidence.
-        if client_asset is not None and reconciled_asset is None:
-            details["_untrusted_asset"] = client_asset
-        if (
-            client_endpoint is not None
-            and registered_endpoint is not None
-            and client_endpoint != registered_endpoint
-        ):
-            details["_untrusted_endpoint"] = client_endpoint
+        # still recorded for the analyst; the attacker IP is preserved as
+        # evidence. The same reasoning (2026-09-18 audit) is why the observed
+        # ``endpoint``/``asset`` are preserved above.
         ev = SecurityEvent(
             event_id=str(
                 raw.get("event_id") or uuid7()
@@ -639,8 +818,8 @@ class InboundIngressProxy:
             event_type=event_type,
             source_ip=client_source_ip,
             destination=_opt_str(raw.get("destination"), 256),
-            endpoint=reconciled_endpoint,
-            asset=reconciled_asset,
+            endpoint=endpoint,
+            asset=asset,
             account=account,
             details=dict(details),
             provenance=provenance,
@@ -652,6 +831,45 @@ class InboundIngressProxy:
             max_details_bytes=self._config.ingest_max_details_bytes,
         )
         return ev
+
+
+def _binding_status_of(source: Any) -> str:
+    """Return the source's capability-binding status as a plain string.
+
+    Tolerates both the Pydantic :class:`SourceInstance` and a raw persisted
+    document (the authoritative resolver may hand back either), and treats
+    "no binding information at all" as ``unbound`` — the honest pre-Phase-5.2
+    state, never an assumed ``bound``.
+    """
+    status = None
+    if isinstance(source, Mapping):
+        status = source.get("capability_binding_status")
+    else:
+        status = getattr(source, "capability_binding_status", None)
+    if hasattr(status, "value"):
+        status = status.value
+    if isinstance(status, str) and status:
+        return status
+    return "unbound"
+
+
+def _capability_id_of(source: Any) -> Optional[str]:
+    """Return the source's **server-side** capability id, or ``None``.
+
+    Only a source whose persisted binding status is ``bound`` contributes a
+    capability. An unbound or quarantined row yields ``None`` so the event is
+    stamped with an honest "no capability" rather than a guess.
+    """
+    if _binding_status_of(source) != "bound":
+        return None
+    value = None
+    if isinstance(source, Mapping):
+        value = source.get("capability_id")
+    else:
+        value = getattr(source, "capability_id", None)
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 def _first_ci_header(

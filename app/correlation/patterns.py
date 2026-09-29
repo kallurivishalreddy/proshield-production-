@@ -79,9 +79,54 @@ from .models import (
     Correlation,
     CorrelationKey,
     CorrelationTrigger,
+    MAX_CORRELATION_CAPABILITIES,
     MAX_KEY_PART_LEN,
     validate_trigger,
 )
+
+
+# ============================================================================
+# Pattern catalogue (capability patch gap 7)
+# ============================================================================
+# The closed, documented list of pattern CLASSES the engine registers.
+# ``correlation.list_patterns`` serves descriptors derived from live
+# instances of these classes — never a hardcoded frontend copy.
+def _register_pattern(cls: type) -> type:
+    PATTERN_CATALOGUE_SINGLETON.append(cls)
+    return cls
+
+
+PATTERN_CATALOGUE_SINGLETON: List[type] = []
+
+
+def describe_pattern(pattern: Any) -> Dict[str, Any]:
+    """A wire-safe descriptor of a registered correlation pattern."""
+    descriptor: Dict[str, Any] = {
+        "pattern_id": str(pattern.pattern_id),
+        "pattern_version": int(pattern.pattern_version),
+        "trigger": str(pattern.trigger),
+    }
+    threshold = getattr(pattern, "threshold", None)
+    if threshold is not None:
+        descriptor["threshold"] = int(threshold)
+    window = getattr(pattern, "window", None)
+    if window is not None:
+        descriptor["window_seconds"] = int(window.total_seconds())
+    return descriptor
+
+
+def describe_registered_patterns() -> List[Dict[str, Any]]:
+    """Describe every pattern class in the catalogue (id-sorted)."""
+    out = []
+    seen: set = set()
+    for cls in PATTERN_CATALOGUE_SINGLETON:
+        instance = cls()
+        if instance.pattern_id in seen:
+            continue
+        seen.add(instance.pattern_id)
+        out.append(describe_pattern(instance))
+    out.sort(key=lambda d: d["pattern_id"])
+    return out
 
 
 # ============================================================================
@@ -371,6 +416,21 @@ class BruteForceClusteringPattern(CorrelationPattern):
                 continue
             det_ids = tuple(sorted(d.detection_id for d in sorted_dets))
             ev_ids = tuple(distinct_event_ids)
+            # Phase 5.2 (§8/§12): derive the correlation's capability
+            # ownership from its OWN member detections. The set is
+            # de-duplicated + sorted by the model validator, so the stored
+            # value is deterministic. A detection whose supporting event
+            # carried no derived capability contributes nothing (empty
+            # string is dropped) — the pattern never invents an owner.
+            cap_ids = tuple(
+                sorted(
+                    {
+                        str(getattr(d, "capability_id", "") or "")
+                        for d in sorted_dets
+                    }
+                    - {""}
+                )
+            )[:MAX_CORRELATION_CAPABILITIES]
             trigger = validate_trigger(self.trigger)
             correlation_id = _build_correlation_id(
                 pattern_id=self.pattern_id,
@@ -386,6 +446,7 @@ class BruteForceClusteringPattern(CorrelationPattern):
                 key=CorrelationKey(parts=(source_ip, endpoint_key)),
                 detection_ids=det_ids,
                 event_ids=ev_ids,
+                capability_ids=cap_ids,
                 window_start=earliest,
                 window_end=latest,
                 count=distinct_count,
@@ -424,3 +485,17 @@ class BruteForceClusteringPattern(CorrelationPattern):
             f"endpoint={endpoint!r} exceeded the threshold of "
             f"{threshold} within a {window_seconds}-second window"
         )
+
+        return (
+            f"brute-force clustering: {count} authentication-failure "
+            f"detections from source_ip={source_ip!r} targeting "
+            f"endpoint={endpoint!r} exceeded the threshold of "
+            f"{threshold} within a {window_seconds}-second window"
+        )
+
+
+# Register the shipped pattern in the wire catalogue (capability
+# patch gap 7). A new pattern class must be appended here so
+# ``correlation.list_patterns`` can discover it — the frontend never
+# hardcodes pattern ids.
+_register_pattern(BruteForceClusteringPattern)

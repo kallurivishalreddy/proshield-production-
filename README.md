@@ -88,6 +88,76 @@ python -m scripts.ingress_server --host 127.0.0.1 --port 8089 --backend mongo
 Current results on this machine: **79 passed in 4.98s** (61 unit
 + 18 integration, against real local MongoDB).
 
+## Run ProShield as an installed Windows application
+
+ProShield ships as a real Windows application: a native desktop shell, a
+Windows Service managed by the SCM, and an installer with a versioned upgrade
+path. See **`docs/WINDOWS_DEPLOYMENT.md`** for the full architecture, layout,
+update design and limitations.
+
+```text
+ProShield.exe            native window (WinForms host + Edge WebView2)
+                         loads the authoritative UI from the analyst plane
+ProShieldService.exe     Windows Service: supervises the two planes,
+                         waits for MongoDB at boot, recovers failed children
+ProShieldSetup-v1.0.0.exe  installer (auto-start, recovery, Start Menu,
+                         uninstaller, in-place upgrade)
+```
+
+### Build a release
+
+```text
+python -m pip install -r deploy/requirements-build.txt
+winget install -e --id JRSoftware.InnoSetup
+
+python -m deploy.signing.generate_keys --channel testing   # once per channel
+
+powershell -ExecutionPolicy Bypass -File deploy\build_release.ps1 ^
+    -Version 1.0.0 -Channel testing -UpdateUrl http://<host>:8099 ^
+    -WithTestModeInstaller
+```
+
+Artefacts land only in `dist/windows/<version>/` (`ProShield.exe`,
+`ProShieldService.exe`, `ProShieldSetup-vX.Y.Z.exe`, `manifest.json`,
+`checksums.txt`, `build-report.json`). The build refuses to produce a release
+whose payload contains `__pycache__`, `.pyc` files, debug dumps, the private
+signing key or any legacy frontend file.
+
+### Install, upgrade, uninstall
+
+```text
+ProShieldSetup-v1.0.0.exe                      install (elevated)
+...setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART     silent update
+deploy\scripts\install_service.ps1             register/repair the service
+unins000.exe                                   uninstall
+```
+
+A normal upgrade is just the newer installer — no manual uninstall, no data
+loss. Runtime data lives in `C:\ProgramData\ProShield\` (config, secrets, logs,
+state, staged updates, rollback backups) and is never in the installer's file
+set, so upgrades cannot touch it. MongoDB is an independent Windows service and
+is never installed, restarted or deleted by ProShield packaging.
+
+### Verify an installation
+
+```text
+python -m scripts.verify_windows_stack --start-console --dev-credentials
+python -m scripts.verify_windows_stack --data-dir "C:\ProgramData\ProShield"
+```
+
+That harness runs the real security workflow over the wire boundary
+(`source -> capability -> ingress -> rule -> detection -> capability
+correlation -> case -> timeline/evidence -> analyst -> central correlation`),
+plus plane separation, crash recovery, and update trust checks (unsigned /
+forged / tampered package rejection and rollback).
+
+### Development mode is unchanged
+
+`python -m scripts.proxy_server ...`, `python -m scripts.ingress_server ...` and
+the whole pytest suite keep working exactly as before. The packaged build runs
+the same `app/` and the same `scripts/proxy_server.py` — no security logic was
+moved, duplicated or rewritten.
+
 ## Architecture map
 
 ```

@@ -132,6 +132,31 @@ class SimpleRule(Rule):
             event, matched=matched, reasoning=reasoning
         )
 
+    def with_metadata(self, metadata: RuleMetadata) -> "SimpleRule":
+        """Return a copy of this rule carrying ``metadata``.
+
+        The **implementation** (the compiled predicate + reasoner that *is*
+        the rule's detection logic) is preserved verbatim; only the metadata /
+        lifecycle view changes. This exists for the managed-rule lifecycle
+        layer (:meth:`app.rules.management.service.RuleManagementService
+        .reload_registry`): when a persisted record for a *library* rule is
+        re-read, the shipped detection logic must stay authoritative while the
+        operator-visible state (``enabled`` / ``state`` / name / tags) is taken
+        from the store. Without this hook the lifecycle layer could only
+        replace the rule with a declarative wrapper — which carries no
+        predicate, so the shipped logic would be silently discarded.
+
+        A rule whose persisted record *does* declare its own conditions is
+        still expressed declaratively; the caller decides that (see the
+        service). This method never evaluates anything and never fails a
+        rule — it is a pure, deterministic rebind.
+        """
+        if not isinstance(metadata, RuleMetadata):
+            raise TypeError(
+                f"metadata must be a RuleMetadata, got {type(metadata).__name__}"
+            )
+        return SimpleRule(metadata, self._predicate, self._reasoner)
+
 
 class RuleEvaluationError(RuntimeError):
     """A rule's ``evaluate`` raised an unexpected exception.

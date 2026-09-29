@@ -181,6 +181,24 @@ class DetectionPipeline:
         persisted: List[Detection] = []
         failures: List[DetectionPersistFailure] = []
         for detection in detection_result.detections:
+            # Capability patch gap 5: compose the documented per-detection
+            # severity band (SeverityEngine) and carry the ingesting
+            # source's provenance pointer onto the detection BEFORE
+            # persistence, so the wire views serve real composed values.
+            try:
+                from ..severity.enrichment import enrich_detection
+
+                detection = enrich_detection(
+                    detection, persisted_event, now=now,
+                )
+            except Exception as exc:  # noqa: BLE001 - pipeline is total
+                _log.warning(
+                    "detection.enrichment_failed",
+                    extra={
+                        "detection_id": detection.detection_id,
+                        "error_type": type(exc).__name__,
+                    },
+                )
             try:
                 self._repo.create(detection)
                 persisted.append(detection)
