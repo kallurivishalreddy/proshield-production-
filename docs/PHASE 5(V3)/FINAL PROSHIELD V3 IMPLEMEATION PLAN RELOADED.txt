@@ -1,0 +1,1070 @@
+Yes. V3 is substantially bigger than V1/V2, because we are not merely adding screens or APIs; we are changing the data lifecycle, ownership model, capability architecture, analyst authority, and future AI-data path.
+
+I reviewed the four attached planning documents together with the completed V2 backend verification. The V3 planning explicitly moves ProShield toward a combined SOC/Blue-Team laboratory/security-data/AI-research system, with capability management, analyst-controlled evidence, datasets and a guided learning workflow. The current V2 foundation is already live-verified, including the real detection→correlation→case pipeline, human IDs, attribution, notes, severity/confidence, telemetry, timeline, notifications and exports.
+
+So I would freeze V3 as 9 implementation phases.
+
+PROSHIELD V3 — FINAL MASTER PLAN
+The final architecture
+                    PROSHIELD V3
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+        ▼                ▼                ▼
+  Beginner Guide    Security Platform   Blue Team Lab
+        │                │                │
+        └────────────────┼────────────────┘
+                         │
+                  CAPABILITY LAYER
+                         │
+                   SOURCE INSTANCES
+                         │
+                       INGRESS
+                         │
+                    NORMALIZATION
+                         │
+                      DETECTION
+                         │
+                    CORRELATION
+                         │
+                INVESTIGATION CASE
+                         │
+                 TEMPORARY EVIDENCE
+                         │
+                  HUMAN AUTHORITY
+                         │
+                ANALYST RESOLUTION
+                         │
+            ┌────────────┼────────────┐
+            ▼            ▼            ▼
+           TP           FP        UNDETERMINED
+            └────────────┼────────────┘
+                         ▼
+             SECURITY EVIDENCE ARCHIVE
+                         │
+                    QUALITY GATE
+                         │
+                  DATASET BUILDER
+                         │
+                  DATASET VERSION
+                         │
+                JSONL / CSV / PARQUET
+                         │
+                      AI / ML
+                         │
+                  FUTURE FEEDBACK
+
+That is the architecture I would now treat as the V3 target, not just a roadmap idea.
+
+PHASE 0 — ARCHITECTURE FREEZE
+
+Goal: do not write feature code until the new domain boundaries are frozen.
+
+Architecture
+
+Define these first-class domains:
+
+Capability
+SourceInstance
+SecurityEvent
+Detection
+Correlation
+Case
+CaseResolution
+SecurityEvidence
+Dataset
+DatasetVersion
+ConfigurationRecycleBin
+ProShieldGuide
+KnowledgeItem
+OnboardingSession
+Most important relationships
+Capability
+   ├── Sources
+   ├── Rules
+   └── Correlation Patterns
+
+Source
+   └── Events
+
+Event
+   └── Detections
+
+Detection
+   └── Correlations
+
+Correlation
+   └── Cases
+
+Case
+   ├── Investigation
+   └── Resolution
+
+Resolution
+   └── SecurityEvidence
+
+SecurityEvidence
+   └── Dataset membership
+Hard architecture rules
+1. One capability → many sources
+2. No subconnector abstraction
+3. Source token identifies source
+4. Source resolves capability
+5. Rules belong to capability
+6. Detection ≠ confirmed threat
+7. Correlation ≠ confirmed threat
+8. Case ≠ training data
+9. Analyst verdict is authoritative
+10. Archived evidence ≠ raw telemetry
+11. Dataset ≠ archive
+12. AI Guide ≠ security decision engine
+
+This phase is essentially the contract for all later phases.
+
+PHASE 1 — CAPABILITY MANAGEMENT
+
+This is the first genuinely new platform component.
+
+Backend
+
+Create a Capability Registry.
+
+Capability fields:
+
+capability_id
+human_id
+name
+description
+responsibility
+implementation
+version
+status
+configuration_schema
+mapping_profiles
+rules
+correlation_patterns
+created_at
+updated_at
+
+Admin operations:
+
+capability.create
+capability.get
+capability.list
+capability.update
+capability.enable
+capability.disable
+capability.retire
+capability.archive
+
+New capabilities must immediately become selectable for sources and rules. The V3 architecture specifically treats capability as the reusable processing/responsibility layer.
+
+Database
+
+New collection:
+
+capabilities
+
+with:
+
+JSON schema validator
+unique capability identifier
+human-ID uniqueness
+lifecycle indexes
+version indexes
+Frontend
+
+New main component:
+
+Capabilities
+
+Pages/views:
+
+Capability List
+Capability Detail
+Create Capability
+Edit Capability
+Capability Rules
+Capability Correlations
+Capability Sources
+Capability Versions
+Capability Health
+
+This becomes the parent context for Sources and Rules.
+
+PHASE 2 — SOURCE ARCHITECTURE 2.0
+
+The existing source functionality stays, but its relationship with capability becomes real.
+
+Backend
+
+Source gets:
+
+capability_id
+capability_version
+source_identity
+unique credential
+configuration
+mapping_profile
+state
+telemetry
+
+Source lifecycle:
+
+CREATED
+ ↓
+CONFIGURED
+ ↓
+VALIDATED
+ ↓
+ACTIVE
+ ↓
+DISABLED
+ ↓
+RETIRED
+ ↓
+ARCHIVED
+
+Retirement:
+
+revoke token immediately
+preserve historical references
+stop ingestion
+retain metadata
+
+The V3 plan explicitly requires source retirement/revocation while preserving historical lineage.
+
+Frontend
+
+Sources becomes:
+
+Sources
+├── Source List
+├── Add Source
+├── Source Detail
+├── Configure
+├── Validate
+├── Enable
+├── Token management
+└── Retire / Archive
+Six-step source wizard
+1. Identity
+2. Capability
+3. Connection
+4. Credentials
+5. Validation
+6. Enable + Verify
+
+This is where the beginner workflow begins.
+
+PHASE 3 — BEGINNER ONBOARDING + REAL LAB
+
+This is the phase that makes ProShield usable by the school/college/non-technical organization you described.
+
+New frontend component
+ProShield Guide
+
+It should be able to start workflows such as:
+
+Connect my firewall
+Connect Windows
+Connect Linux
+Create my first rule
+Learn brute-force detection
+Investigate my first case
+Example workflow
+"Let's learn brute force"
+
+Step 1
+Open PowerShell.
+
+Step 2
+Start the local demo external source.
+
+Step 3
+Create a ProShield source.
+
+Step 4
+Select the correct capability.
+
+Step 5
+Configure the six source steps.
+
+Step 6
+Validate first event.
+
+Step 7
+Go to Rules.
+
+Step 8
+Create a brute-force rule.
+
+Step 9
+Test the rule through PowerShell.
+
+Step 10
+Inspect detection.
+
+Step 11
+Trigger correlation.
+
+Step 12
+Investigate case.
+
+Step 13
+Make analyst decision.
+
+The V3 planning specifically connects real-world activity generation, ingestion, detection and analyst learning.
+
+PHASE 4 — INVESTIGATION + HUMAN AUTHORITY
+
+This phase changes what a “closed case” means.
+
+Backend
+
+Create:
+
+CaseResolution
+
+Fields:
+
+verdict
+classification
+benign_reason
+analyst_confidence
+reasoning
+evidence_reviewed
+detection_assessment
+severity_assessment
+analyst_id
+resolved_at
+Verdict
+TRUE_POSITIVE
+FALSE_POSITIVE
+BENIGN
+SUSPICIOUS
+UNDETERMINED
+DISPUTED
+TP classification
+Credential Attack
+Brute Force
+Credential Stuffing
+Malware
+Command & Scripting
+Privilege Escalation
+Persistence
+Lateral Movement
+Data Exfiltration
+Reconnaissance
+Defense Evasion
+Other
+FP/Benign reasons
+Normal User Behavior
+Administrator Activity
+Security Scanner
+Automated System/Service
+Scheduled Job
+Configuration/Deployment
+Testing/Development
+Expected Application Behavior
+Detection Rule Too Broad
+Duplicate/Correlated Noise
+Other
+UI
+
+Case closure becomes:
+
+RESOLVE CASE
+
+Verdict
+Classification
+Reason
+Confidence
+Severity correctness
+Detection correctness
+Evidence reviewed
+Analyst explanation
+
+[Resolve Case]
+
+This analyst-decision model is explicitly described in the attached UI planning.
+
+PHASE 5 — TEMPORARY SECURITY DATA LIFECYCLE
+
+This is one of the biggest architecture changes.
+
+Backend
+
+Introduce lifecycle classes:
+
+LIVE
+INVESTIGATION
+CURATED
+ARCHIVED
+DATASET
+Candidate data
+
+Initially:
+
+event
+detection
+correlation
+case
+timeline
+original evidence
+
+stays in the temporary investigation layer.
+
+After case closure
+Analyst verdict
+      ↓
+Retention decision
+      ↓
+Promote selected knowledge
+OR
+expire
+
+This implements the principle from the V3 plan that ProShield does not need to retain every piece of telemetry forever.
+
+Database
+
+Possible new collections:
+
+investigation_evidence
+retention_policies
+retention_jobs
+
+Exact physical design should be finalized after implementation profiling.
+
+PHASE 6 — SECURITY EVIDENCE ARCHIVE
+
+New major application component:
+
+Security Evidence
+
+This is not the configuration recycle bin.
+
+Archive categories
+Confirmed Threats
+False Positives
+Benign Activity
+Suspicious / Undetermined
+Disputed
+
+The archive design in the supplied planning explicitly keeps analyst context, evidence, reasoning and provenance rather than merely storing “TP/FP.”
+
+Backend
+
+Create:
+
+SecurityEvidence
+EvidenceRepository
+EvidenceQualityService
+EvidencePromotionService
+
+Each record contains:
+
+ARCH-000001
+case_id
+source_id
+capability_id
+rule_id
+rule_version
+detection_id
+correlation_id
+event_context
+evidence
+verdict
+classification
+reason
+analyst_confidence
+analyst_reasoning
+severity_assessment
+provenance
+quality_state
+Quality state
+CANDIDATE
+REVIEW_REQUIRED
+VALIDATED
+REJECTED
+DATASET_ELIGIBLE
+Critical rule
+Analyst labelled
+       ≠
+Automatically training-ready
+PHASE 7 — AI DATASET SYSTEM
+
+New main UI component:
+
+AI Dataset
+
+This is separate from Security Evidence.
+
+Backend
+
+Create:
+
+Dataset
+DatasetVersion
+DatasetBuilder
+DatasetQualityService
+DatasetExporter
+Dataset filters
+Verdict
+Capability
+Source
+Rule
+Rule version
+Classification
+Confidence
+Severity assessment
+Date range
+Analyst
+Quality state
+Dataset structure
+Dataset
+ └── DatasetVersion
+       ├── included examples
+       ├── excluded examples
+       ├── filters
+       ├── statistics
+       ├── provenance
+       └── quality state
+
+The planning explicitly calls for dataset versioning and controlled promotion rather than treating the archive as the dataset.
+
+PHASE 8 — EXPORT SYSTEM
+
+We should now have two different export systems.
+
+Human exports
+PDF
+CSV
+Markdown
+
+for:
+
+investigation
+reports
+archive inspection
+sharing
+AI dataset exports
+JSONL
+CSV
+Parquet
+
+for:
+
+ML experiments
+data analysis
+training
+evaluation
+
+The attached dataset planning explicitly distinguishes the AI export path from ordinary investigation/report export.
+
+UI
+Security Evidence
+    ↓
+Export Evidence
+
+AI Dataset
+    ↓
+Build Dataset
+    ↓
+Review
+    ↓
+Approve
+    ↓
+Export
+
+Do not use a button called:
+
+Train AI
+
+Use:
+
+Export AI Dataset
+
+because training occurs outside ProShield initially.
+
+PHASE 9 — PROSHIELD GUIDE / AI BOT
+
+This should be the final major V3 component after the domain model is stable.
+
+And here I strongly agree with your instinct:
+
+Do NOT make the bot a heavily trained model.
+
+Use:
+
+LLM
+ +
+authoritative ProShield knowledge
+ +
+current ProShield state
+ +
+UI context
+ +
+workflow engine
+ +
+safe tools
+
+The V3 plan's knowledge/learning direction fits this exactly.
+
+Bot modes
+Guide
+
+What do I do next?
+
+Learn
+
+Explain this concept.
+
+Troubleshoot
+
+Why isn't my source working?
+
+Lab
+
+Help me run this experiment.
+
+Investigate
+
+Help me understand this case.
+
+Architecture
+
+Why does capability work this way?
+
+How the bot should work
+
+Example:
+
+User:
+I want to learn brute force.
+
+Guide:
+Great. We'll run a real local experiment.
+
+Step 1:
+Open PowerShell.
+
+[Start Step]
+
+Step 2:
+Start the demo source.
+
+[Copy command]
+
+Step 3:
+Go to Sources.
+
+[Open Sources]
+
+Step 4:
+Create New Source.
+
+Capability:
+NGINX Security
+
+Why:
+...
+
+Step 5:
+Validate.
+
+...
+
+Step 6:
+Create rule.
+
+You can ask ChatGPT for help writing the rule.
+Here is a safe prompt:
+[Copy]
+
+Paste the rule here.
+
+...
+
+Step 7:
+Test through PowerShell.
+
+...
+
+Step 8:
+Investigate the generated case.
+
+...
+
+Step 9:
+You are now the analyst.
+Choose the final verdict.
+
+That is not a generic chatbot.
+
+It is a workflow-aware tutor.
+
+Does GLM 5.3 Flash need training?
+No — not for V3.
+
+This is important.
+
+I would not make fine-tuning part of the V3 critical path.
+
+Use:
+
+GLM 5.3 Flash
+      +
+ProShield V3 knowledge
+      +
+workflow definitions
+      +
+current state/tool access
+
+The model should receive authoritative information such as:
+
+What capabilities exist
+What pages exist
+What operations exist
+What fields exist
+What workflows exist
+What is current
+What is planned
+What is forbidden
+How each workflow progresses
+The knowledge source should be structured
+
+For example:
+
+knowledge/
+├── architecture/
+├── capabilities/
+├── sources/
+├── rules/
+├── investigations/
+├── archive/
+├── datasets/
+├── troubleshooting/
+├── learning/
+└── workflows/
+
+Each knowledge item can have:
+
+concept
+definition
+why
+how
+next_step
+related_entities
+version
+status
+Fine-tuning can come later
+
+Once you have many real interaction examples:
+
+user question
+→ Guide answer
+→ user action
+→ outcome
+
+then you can study whether fine-tuning improves the Guide.
+
+For V3, retrieval + structured knowledge + tools is the safer and more controllable approach.
+
+DATABASE MASTER CHANGES
+
+The database architecture changes significantly, but we should not migrate DB engines yet.
+
+Existing
+security_events
+detections
+correlations
+incidents
+managed_rules
+source_instances
+reports
+notifications
+source_telemetry
+counters
+V3 adds
+capabilities
+capability_versions
+case_resolutions
+investigation_evidence
+security_evidence
+evidence_quality
+retention_policies
+recycle_bin
+datasets
+dataset_versions
+dataset_membership
+guide_knowledge
+onboarding_sessions
+guide_workflows
+
+Potentially more depending on implementation.
+
+The exact collection normalization should be decided only after the domain model and access patterns are frozen.
+
+WHAT HAPPENS TO THE EXISTING V2 FEATURES?
+
+They are foundation, not reimplementation.
+
+Already established:
+
+✓ live ingestion
+✓ source auth
+✓ replay protection
+✓ detection
+✓ correlation
+✓ case creation
+✓ human IDs
+✓ case attribution
+✓ notes
+✓ severity
+✓ confidence
+✓ pattern catalogue
+✓ notifications
+✓ deep health
+✓ source telemetry
+✓ global timeline
+✓ server-side timeseries
+✓ report export
+✓ rule lifecycle
+✓ DB validators/indexes
+
+The latest patch report reports these through live HTTP/browser/fresh-DB/adversarial verification.
+
+V3 extends them, especially case resolution, provenance, lifecycle and data promotion.
+
+FINAL FRONTEND COMPONENT MAP
+
+The finished application should roughly be:
+
+Overview
+│
+├── Investigations
+│   ├── Incidents
+│   └── Case Detail
+│
+├── Detection Intelligence
+│   ├── Detections
+│   ├── Correlations
+│   └── Timeline
+│
+├── Sources
+│   └── Source Wizard
+│
+├── Capabilities
+│   ├── Capability List
+│   └── Capability Detail
+│
+├── Rules
+│
+├── Security Evidence
+│   ├── Archive
+│   ├── TP
+│   ├── FP
+│   ├── Benign
+│   ├── Undetermined
+│   └── Disputed
+│
+├── AI Dataset
+│   ├── Dataset Builder
+│   ├── Review
+│   ├── Versions
+│   └── Export
+│
+├── Configuration Recycle Bin
+│
+├── Health
+│
+├── Notifications
+│
+└── ProShield Guide
+
+That is the new UI architecture.
+
+WHAT IS FRONTEND VS BACKEND VS ARCHITECTURE?
+Feature	Architecture	Backend	Database	Frontend
+Capability Registry	Major	Major	New	New page
+Capability versions	Major	Major	New	Detail UI
+Source→Capability	Major	Modify	Modify	Source wizard
+Per-source credentials	Security architecture	Modify	Modify	Token UI
+Source retirement	Lifecycle	Modify	Modify	Source UI
+Recycle Bin	Lifecycle	New	New	New page
+Temporary investigation	Major	Major	New/modified	Case UI
+Case resolution	Major	Major	New fields/domain	Major case UI
+TP/FP/Benign	Data model	Major	New	Resolution UI
+Provenance	Major	Major	New fields	Evidence UI
+Security Evidence	Major	Major	New	New page
+Evidence quality	Governance	New	New	Review UI
+AI Dataset	Major	Major	New	New page
+Dataset versions	Major	New	New	New UI
+AI exports	Data architecture	New	Reads archive	New UI
+Beginner onboarding	UX architecture	Workflow APIs	Session state	Major
+ProShield Guide	AI architecture	Major	Knowledge/state	Major
+Learning labs	Educational architecture	Workflow engine	Optional	Major
+Existing SOC pages	Preserve	Minor extension	Minor	Visual integration
+Health	Extend	Modify	Minor	Extend
+THE 9-PHASE IMPLEMENTATION ORDER
+
+The dependency order matters.
+
+PHASE 0
+Architecture Freeze
+        ↓
+PHASE 1
+Capability Management
+        ↓
+PHASE 2
+Source Architecture 2.0
+        ↓
+PHASE 3
+Beginner Onboarding + Lab
+        ↓
+PHASE 4
+Human Authority / Case Resolution
+        ↓
+PHASE 5
+Temporary Data Lifecycle
+        ↓
+PHASE 6
+Security Evidence Archive
+        ↓
+PHASE 7
+AI Dataset System
+        ↓
+PHASE 8
+Export / Dataset Versioning
+        ↓
+PHASE 9
+ProShield Guide AI
+        ↓
+FINAL ADVERSARIAL RE-AUDIT
+
+I would not reverse this order.
+
+For example, building the AI bot before the workflow/domain APIs exist would make the bot hallucinate or invent workflows.
+
+TESTING GATES BETWEEN PHASES
+
+Every phase should have its own gate:
+
+Implementation
+ ↓
+Unit tests
+ ↓
+Integration tests
+ ↓
+DB validator/index tests
+ ↓
+API contract tests
+ ↓
+Real runtime
+ ↓
+Browser
+ ↓
+Adversarial tests
+ ↓
+Restart
+ ↓
+Phase approval
+
+Then the final V3 gate:
+
+Fresh DB
++
+Real external source
++
+PowerShell laboratory
++
+Full case lifecycle
++
+Analyst resolution
++
+Archive promotion
++
+Dataset generation
++
+Dataset export
++
+Guide workflow
++
+Browser verification
++
+Responsive verification
++
+Independent adversarial audit
+
+The reason to keep this strict is demonstrated by V2: the final patch was only considered credible after automated, fresh-DB, live HTTP, restart, browser and adversarial evidence—not merely because the code compiled or unit tests passed.
+
+One very important correction to the "game changer" idea
+
+I agree that this could become a genuinely differentiated architecture, but I would not yet call it a market game changer as a factual claim.
+
+The technically defensible claim today is:
+
+ProShield is deliberately building a different security workflow: a beginner-accessible Blue Team/SOC platform where human investigation decisions become structured, provenance-rich security knowledge that can later be converted into versioned AI datasets.
+
+That's a strong architecture.
+
+Whether it is actually novel compared with existing products/research needs a separate market and literature comparison.
+
+The final V3 mental model
+
+This is the one diagram I would give every implementation agent:
+
+                  ┌──────────────────────┐
+                  │   PROSHIELD GUIDE    │
+                  │ Learn / Guide / Lab  │
+                  └──────────┬───────────┘
+                             │
+                             ▼
+CAPABILITY ───────► SOURCE ───────► INGRESS
+    │                                  │
+    │                                  ▼
+    ├──────── RULES ─────────────► EVENT
+    │                                  │
+    │                                  ▼
+    └── CORRELATION PATTERNS ───► DETECTION
+                                       │
+                                       ▼
+                                  CORRELATION
+                                       │
+                                       ▼
+                                     CASE
+                                       │
+                                       ▼
+                              TEMPORARY EVIDENCE
+                                       │
+                                       ▼
+                              HUMAN INVESTIGATION
+                                       │
+                                       ▼
+                              ANALYST RESOLUTION
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    ▼                  ▼                  ▼
+                   TP                 FP             UNCERTAIN
+                    └──────────────────┼──────────────────┘
+                                       ▼
+                           SECURITY EVIDENCE ARCHIVE
+                                       │
+                                  QUALITY GATE
+                                       │
+                                  DATASET BUILDER
+                                       │
+                                 DATASET VERSION
+                                       │
+                              JSONL / CSV / PARQUET
+                                       │
+                                  AI / ML RESEARCH
+
+And the human remains above the AI decision, not below it.
+
+That is the real V3 game: ProShield learns from human security work instead of pretending the AI should replace the human first.
+
+The attached architecture planning, analyst UI plan and dataset plan all converge on that direction.
+
+This is the version I would now freeze as the master V3 scope.
