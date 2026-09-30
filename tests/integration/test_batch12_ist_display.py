@@ -136,7 +136,7 @@ def ist_output() -> dict:
     bundle = workdir / "format.mjs"
     try:
         bundle_cmd = [
-            "node", str(ESBUILD), str(FORMAT_TS),
+            str(ESBUILD), str(FORMAT_TS),
             "--bundle", "--format=esm", "--platform=node",
             f"--outfile={bundle}", "--log-level=warning",
         ]
