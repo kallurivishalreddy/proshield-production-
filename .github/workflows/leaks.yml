@@ -9,15 +9,13 @@ on:
   pull_request:
     branches: [main]
 
-# Least-privilege permissions. The action needs read access to the
-# repository contents to scan them. The default GITHUB_TOKEN (which
-# inherits from these permissions) is used by the action to upload
-# the SARIF artifact and post the job summary; no other scopes are
-# requested. No paid GitHub Advanced Security is required: the SARIF
-# is delivered as a workflow artifact that any repo collaborator
-# can download, independent of the GHAS "Code scanning" UI.
+# Least-privilege permissions: contents read allows checkout and scanning;
+# pull-requests read lets Gitleaks list commits for pull-request scans.
+# PR comments are disabled below, so no write permission is requested.
+# SARIF output is retained as a workflow artifact.
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   gitleaks:
@@ -25,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # fetch-depth: 0 is the gitleaks-action recommendation: it
           # gives the scanner the full git history so that a secret
@@ -48,3 +46,4 @@ jobs:
           # The default GITHUB_TOKEN is forwarded so the action can
           # upload the SARIF artifact and post the job summary.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: 'false'
