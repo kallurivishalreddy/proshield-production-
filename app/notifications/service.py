@@ -21,6 +21,7 @@ from ..domain.errors import NotFoundError, ValidationError
 from .repository import (
     NotificationRepository,
     build_notification,
+    build_unknown_event_notification,
 )
 
 
@@ -75,6 +76,18 @@ class NotificationService:
     def sink(self, **kwargs: Any) -> None:
         """The exact callable shape the incident service expects."""
         self.emit(**kwargs)
+
+    def emit_unknown_event(self, *, event: Any) -> Dict[str, Any]:
+        """Persist one ADR-037 unknown-event classification alert.
+
+        Idempotent per event: replaying the pipeline for the same event
+        returns the existing notification instead of creating a duplicate.
+        The alert contains no rule_id/detection_id and does not create a
+        detection, correlation, incident, or case.
+        """
+        notification = build_unknown_event_notification(event)
+        stored = self._repository.create_idempotent(notification)
+        return stored.to_dict()
 
     # ------------------------------------------------------------------
     # Reads / updates (wire ops)

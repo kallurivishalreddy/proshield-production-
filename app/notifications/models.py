@@ -29,6 +29,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    model_validator,
 )
 from typing_extensions import Annotated
 
@@ -48,6 +49,7 @@ NOTIFICATION_KINDS = (
     "case.closed",
     "case.note_added",
     "case.centralized_failed",
+    "event.unknown",
 )
 
 NotificationId = Annotated[
@@ -87,6 +89,23 @@ class Notification(BaseModel):
     # The case the notification is about (empty for non-case kinds).
     incident_id: Annotated[str, StringConstraints(max_length=64)] = ""
     human_id: Annotated[str, StringConstraints(max_length=32)] = ""
+    # ADR-037: an unknown-event classification is an event-scoped alert,
+    # never a fabricated rule/detection. These fields are populated only
+    # for ``event.unknown`` and are empty for the case kinds.
+    event_id: Annotated[str, StringConstraints(max_length=64)] = ""
+    classification: Annotated[str, StringConstraints(max_length=32)] = ""
+    rule_id: Annotated[str, StringConstraints(max_length=64)] = ""
+    detection_id: Annotated[str, StringConstraints(max_length=64)] = ""
+    source_instance_id: Annotated[str, StringConstraints(max_length=96)] = ""
+    capability_id: Annotated[str, StringConstraints(max_length=64)] = ""
+    event_time: Optional[datetime] = None
+    evidence_refs: Tuple[
+        Annotated[str, StringConstraints(min_length=1, max_length=128)],
+        ...,
+    ] = Field(default_factory=tuple, max_length=32)
+    explanation: Annotated[
+        str, StringConstraints(max_length=MAX_NOTIFICATION_DETAIL_LEN)
+    ] = ""
     title: Annotated[
         str, StringConstraints(max_length=MAX_NOTIFICATION_MESSAGE_LEN)
     ] = ""
@@ -105,12 +124,43 @@ class Notification(BaseModel):
     read_at: Optional[datetime] = None
     created_at: datetime
 
+    @model_validator(mode="after")
+    def _check_unknown_event_contract(self) -> "Notification":
+        """An unknown notification must not fabricate rule evidence."""
+        if self.kind == "event.unknown":
+            if not self.event_id:
+                raise ValueError("event.unknown requires event_id")
+            if self.classification != "unknown":
+                raise ValueError(
+                    "event.unknown requires classification='unknown'"
+                )
+            if self.rule_id or self.detection_id:
+                raise ValueError(
+                    "event.unknown must not carry rule_id or detection_id"
+                )
+            if self.event_id not in self.evidence_refs:
+                raise ValueError(
+                    "event.unknown evidence_refs must include event_id"
+                )
+        return self
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "notification_id": self.notification_id,
             "kind": self.kind,
             "incident_id": self.incident_id or None,
             "human_id": self.human_id or None,
+            "event_id": self.event_id or None,
+            "classification": self.classification or None,
+            "rule_id": self.rule_id or None,
+            "detection_id": self.detection_id or None,
+            "source_instance_id": self.source_instance_id or None,
+            "capability_id": self.capability_id or None,
+            "event_time": (
+                self.event_time.isoformat() if self.event_time else None
+            ),
+            "evidence_refs": list(self.evidence_refs),
+            "explanation": self.explanation or None,
             "title": self.title,
             "detail": self.detail or None,
             "actor_subject_id": self.actor_subject_id or None,

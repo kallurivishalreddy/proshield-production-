@@ -18,7 +18,7 @@ Coverage
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.auth import ADMIN_ROLE, Identity
 from app.domain.security_event import (
@@ -113,6 +113,58 @@ class TestF1LiveDetection:
         )
         outcome = pipe.process(event, now=now)
         assert outcome.detections == ()
+
+
+class TestF3ExactReplayIdempotency:
+    def test_exact_replay_reuses_detections_without_hiding_new_events(
+        self,
+    ) -> None:
+        """H-03: the same canonical event must not create new detections.
+
+        The live path passes a wall-clock ``now`` to detection, so the
+        replay's ``detected_at`` differs. The logical detection identity
+        (event, rule, rule version) must still be reused. A separate,
+        genuinely distinct event must continue to produce its own
+        detections.
+        """
+        bundle = _build_bundle()
+        db = proxy_server.FakeDatabase()
+        pipe = build_live_pipeline(
+            config=bundle.config,
+            db=db,
+            rule_registry=bundle.rule_registry,
+            incident_service=IncidentService(
+                repository=IncidentRepository(db=db, config=bundle.config),
+            ),
+        )
+        event_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        first_now = datetime.now(timezone.utc)
+        second_now = first_now + timedelta(seconds=5)
+        event = _auth_failure_event(1, event_time)
+
+        first = pipe.process(event, now=first_now)
+        first_ids = sorted(d.detection_id for d in first.detections)
+        assert len(first_ids) == 2
+
+        second = pipe.process(event, now=second_now, event_persisted=True)
+        second_ids = sorted(d.detection_id for d in second.detections)
+        assert second_ids == first_ids
+        assert len(
+            pipe._pipeline.detection_repository.find_by_event_id(
+                event.event_id
+            )
+        ) == 2
+
+        other = _auth_failure_event(2, event_time + timedelta(minutes=1))
+        third = pipe.process(other, now=second_now + timedelta(seconds=1))
+        third_ids = sorted(d.detection_id for d in third.detections)
+        assert len(third_ids) == 2
+        assert set(third_ids).isdisjoint(first_ids)
+        assert len(
+            pipe._pipeline.detection_repository.find_by_event_id(
+                other.event_id
+            )
+        ) == 2
 
 
 class TestF2CorrelationOpensIdempotentCase:

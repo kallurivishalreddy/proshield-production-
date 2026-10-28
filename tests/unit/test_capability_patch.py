@@ -30,6 +30,7 @@ from app.domain.security_event import (
     SecurityEvent,
     SecurityEventProvenance,
 )
+from app.domain.uuid7 import uuid7
 from app.domain.errors import ValidationError as DomainValidationError
 from app.incidents.errors import (
     CaseNotFoundError,
@@ -39,8 +40,10 @@ from app.incidents.models import CASE_STATE_ACKNOWLEDGED
 from app.incidents.repository import IncidentRepository
 from app.incidents.service import IncidentService
 from app.notifications import (
+    NOTIFICATIONS_COLLECTION,
     NotificationRepository,
     NotificationService,
+    build_notification,
 )
 from app.observability.health import (
     DEGRADED,
@@ -659,6 +662,78 @@ class TestSourceTelemetry:
 # Gap 12: notification feed
 # =====================================================================
 class TestNotifications:
+    @staticmethod
+    def _unknown_event() -> SecurityEvent:
+        now = datetime.now(timezone.utc)
+        return SecurityEvent(
+            event_id=str(uuid7()),
+            event_time=now,
+            ingested_at=now,
+            source="nginx",
+            event_type="suspicious_request",
+            provenance=SecurityEventProvenance(
+                collector="nginx",
+                source_event_id="v2-unknown-classification",
+                source_instance_id=(
+                    "src-0198c2a1-7e3b-7a8e-b7b6-4f6a7d4d5f01-a"
+                ),
+                capability_id="cap-nginx",
+            ),
+            source_ip="198.51.100.181",
+            endpoint="/unclassified/v2",
+            asset="web-app",
+            details={"status_code": 200, "http_method": "GET"},
+        )
+
+    def test_unknown_event_notification_is_persisted_and_idempotent(
+        self, db, config,
+    ) -> None:
+        event = self._unknown_event()
+        service = NotificationService(
+            repository=NotificationRepository(db, config),
+        )
+        first = service.emit_unknown_event(event=event)
+        second = service.emit_unknown_event(event=event)
+
+        assert first["notification_id"] == second["notification_id"]
+        assert first["kind"] == "event.unknown"
+        assert first["classification"] == "unknown"
+        assert first["event_id"] == event.event_id
+        assert first["rule_id"] is None
+        assert first["detection_id"] is None
+        assert first["evidence_refs"] == [event.event_id]
+        assert first["explanation"]
+        assert "matched no active rule" in first["detail"]
+        assert "cap-nginx" in first["detail"]
+
+        items = service.list_for_identity(identity=ANALYST)
+        assert len(items) == 1
+        assert items[0]["notification_id"] == first["notification_id"]
+        assert items[0]["event_id"] == event.event_id
+
+        doc = db[NOTIFICATIONS_COLLECTION].find_one(
+            {"notification_id": first["notification_id"]}
+        )
+        assert doc is not None
+        assert doc["kind"] == "event.unknown"
+        assert doc["classification"] == "unknown"
+        assert doc["event_id"] == event.event_id
+        assert doc["rule_id"] == ""
+        assert doc["detection_id"] == ""
+        assert list(doc["evidence_refs"]) == [event.event_id]
+
+    def test_unknown_event_notification_rejects_rule_evidence(self) -> None:
+        event = self._unknown_event()
+        with pytest.raises(ValueError):
+            build_notification(
+                kind="event.unknown",
+                event_id=event.event_id,
+                classification="unknown",
+                rule_id="NGINX-AUTH-FAILURE-001",
+                evidence_refs=(event.event_id,),
+                title="t",
+            )
+
     def test_emit_and_list(self, db, config) -> None:
         service = NotificationService(
             repository=NotificationRepository(db, config),

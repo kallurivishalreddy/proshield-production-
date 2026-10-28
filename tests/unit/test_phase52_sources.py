@@ -15,6 +15,7 @@ docs/PHASE 5(V3)/PHASE 5.0/PHASE-05-00-V3-ARCHITECTURE-FREEZE.md §7.1/§12/§29
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -22,7 +23,7 @@ import pytest
 
 from app.auth import ADMIN_ROLE, ANALYST_ROLE, Identity
 from app.config import ProShieldConfig
-from app.sources.audit import SOURCE_AUDIT_COLLECTION
+from app.sources.audit import SOURCE_AUDIT_COLLECTION, read_audit_records
 from app.sources.capability_binding import (
     CAPABILITY_ID_TO_SOURCE_TYPE,
     SOURCE_TYPE_TO_CAPABILITY_ID,
@@ -779,6 +780,101 @@ class TestLifecycleBindingGate:
             identity=_ADMIN, source_instance_id=sid,
         )
         assert first != rotated
+
+# ===========================================================================
+# 5b. Lifecycle audit trail — every successful transition is recorded
+# ===========================================================================
+class TestLifecycleAuditTrail:
+    """Regression: enable/disable/retire must append one audit record each."""
+
+    def _configured(self):
+        audit = _AuditFakeCollection()
+        svc = _service(
+            issuer=SourceIdentityTokenIssuer(secret=_SECRET),
+            audit=audit,
+        )
+        view = svc.register(
+            identity=_ADMIN,
+            source_type=SourceType.NGINX,
+            display_name="lifecycle-audit",
+        )
+        sid = view.source_instance_id
+        svc.configure(
+            identity=_ADMIN,
+            source_instance_id=sid,
+            configuration=_cfg_payload(),
+        )
+        svc.validate_connection(
+            identity=_ADMIN,
+            source_instance_id=sid,
+        )
+        return svc, audit, sid
+
+    @staticmethod
+    def _rows(audit, sid, action):
+        return [
+            row for row in audit.docs
+            if row.get("source_instance_id") == sid
+            and row.get("action") == action
+        ]
+
+    def _assert_lifecycle_row(self, row, before, after):
+        assert row["actor"] == "user-admin-001"
+        assert row["capability_id"] == "cap-nginx"
+        assert row["before"]["state"] == before
+        assert row["after"]["state"] == after
+        assert row["changed_fields"] == ["state"]
+        assert row["reason"] == (
+            f"lifecycle transition {before.value} -> {after.value}"
+        )
+        serialized = json.dumps(row, default=str).lower()
+        assert "token" not in serialized
+        assert "secret" not in serialized
+
+    def _assert_readable(self, audit, sid, action, after):
+        records = read_audit_records(audit, sid, limit=50)
+        matching = [r for r in records if r.get("action") == action]
+        assert len(matching) == 1
+        assert matching[0]["source_instance_id"] == sid
+        assert matching[0]["after"]["state"] == after
+
+    def test_enable_writes_exactly_one_lifecycle_audit_record(self) -> None:
+        svc, audit, sid = self._configured()
+        svc.enable(identity=_ADMIN, source_instance_id=sid)
+        rows = self._rows(audit, sid, "source_enable")
+        assert len(rows) == 1
+        self._assert_lifecycle_row(
+            rows[0], SourceState.VALIDATED, SourceState.ENABLED,
+        )
+        self._assert_readable(
+            audit, sid, "source_enable", SourceState.ENABLED,
+        )
+
+    def test_disable_writes_exactly_one_lifecycle_audit_record(self) -> None:
+        svc, audit, sid = self._configured()
+        svc.enable(identity=_ADMIN, source_instance_id=sid)
+        svc.disable(identity=_ADMIN, source_instance_id=sid)
+        rows = self._rows(audit, sid, "source_disable")
+        assert len(rows) == 1
+        self._assert_lifecycle_row(
+            rows[0], SourceState.ENABLED, SourceState.DISABLED,
+        )
+        self._assert_readable(
+            audit, sid, "source_disable", SourceState.DISABLED,
+        )
+
+    def test_retire_writes_exactly_one_lifecycle_audit_record(self) -> None:
+        svc, audit, sid = self._configured()
+        svc.enable(identity=_ADMIN, source_instance_id=sid)
+        svc.retire(identity=_ADMIN, source_instance_id=sid)
+        rows = self._rows(audit, sid, "source_retire")
+        assert len(rows) == 1
+        self._assert_lifecycle_row(
+            rows[0], SourceState.ENABLED, SourceState.RETIRED,
+        )
+        self._assert_readable(
+            audit, sid, "source_retire", SourceState.RETIRED,
+        )
 
 # ===========================================================================
 # 6. Token / trust model — per-source isolation

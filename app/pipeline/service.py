@@ -103,6 +103,7 @@ class LivePipeline:
         case_identity: Optional[Identity] = None,
         correlation_window: Optional[timedelta] = None,
         rule_lifecycle_sync: Optional[Any] = None,
+        unknown_event_sink: Optional[Any] = None,
     ) -> None:
         self._config = config
         self._pipeline = detection_pipeline
@@ -116,6 +117,11 @@ class LivePipeline:
         # rule.disable / rule.enable / rule.retire made on the analyst
         # plane take effect on the next event without a restart.
         self._rule_lifecycle_sync = rule_lifecycle_sync
+        # ADR-037: persist an unknown-event classification alert when a
+        # valid event matches no active rule. This is an injected sink so
+        # the pipeline stays independent of the notification persistence
+        # layer; production wires NotificationService.emit_unknown_event.
+        self._unknown_event_sink = unknown_event_sink
         self._correlation_window = (
             correlation_window
             if correlation_window is not None
@@ -228,6 +234,36 @@ class LivePipeline:
                 f"detection persistence failed: "
                 f"{getattr(failure, 'safe_message', 'unknown error')}"
             )
+
+        no_rule_match = (
+            not pipeline_result.detection_result.detections
+            and not pipeline_result.detection_result.errors
+            and not getattr(pipeline_result, "persist_failures", ())
+        )
+        if no_rule_match:
+            if self._unknown_event_sink is None:
+                _log.warning(
+                    "pipeline.unknown_event_sink_absent event_id=%s",
+                    persisted_event.event_id,
+                )
+            else:
+                try:
+                    self._unknown_event_sink(event=persisted_event)
+                    _log.info(
+                        "pipeline.unknown_event_classified event_id=%s",
+                        persisted_event.event_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - never block ingest
+                    _log.warning(
+                        "pipeline.unknown_event_classification_failed "
+                        "event_id=%s error=%s",
+                        persisted_event.event_id,
+                        type(exc).__name__,
+                    )
+                    errors.append(
+                        "unknown classification failed: "
+                        f"{type(exc).__name__}"
+                    )
 
         if not new_detections:
             # No detection -> nothing to correlate; the event is
@@ -421,6 +457,7 @@ def build_live_pipeline(
     correlation_window: Optional[timedelta] = None,
     detection_pipeline: Optional[DetectionPipeline] = None,
     rule_repository: Optional[Any] = None,
+    unknown_event_sink: Optional[Any] = None,
 ) -> LivePipeline:
     """Build a :class:`LivePipeline` from an app ``db`` handle.
 
@@ -434,6 +471,11 @@ def build_live_pipeline(
     the pipeline additionally wires a :class:`ManagedRuleLifecycleSync`
     so rule enable/disable/retire made on the analyst plane governs
     the live detector (V2-01).
+
+    ``unknown_event_sink`` receives the persisted event when no active
+    rule matched (ADR-037). The deployment wires
+    ``NotificationService.emit_unknown_event`` so the unknown
+    classification is persisted in the existing analyst feed.
     """
     from ..correlation.engine import CorrelationEngine as _CE
     from ..correlation.patterns import BruteForceClusteringPattern
@@ -480,4 +522,5 @@ def build_live_pipeline(
         case_identity=case_identity,
         correlation_window=correlation_window,
         rule_lifecycle_sync=rule_lifecycle_sync,
+        unknown_event_sink=unknown_event_sink,
     )

@@ -15,6 +15,7 @@ from .repository import (
     NOTIFICATIONS_VALIDATOR,
     NotificationRepository,
     build_notification,
+    build_unknown_event_notification,
 )
 from .service import NotificationService
 
@@ -27,5 +28,6 @@ __all__ = [
     "NotificationRepository",
     "NotificationService",
     "build_notification",
+    "build_unknown_event_notification",
     "new_notification_id",
 ]

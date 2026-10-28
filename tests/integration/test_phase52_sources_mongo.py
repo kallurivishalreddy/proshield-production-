@@ -17,6 +17,7 @@ Reference: docs/PHASE 5(V3)/PHASE-05-V3-IMPLEMENTATION-MASTER-PLAN.md §19.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -24,7 +25,7 @@ from pymongo.errors import WriteError
 
 from app.auth.identity import Identity
 from app.persistence.bootstrap import ensure_all_collections
-from app.sources.audit import SOURCE_AUDIT_COLLECTION
+from app.sources.audit import SOURCE_AUDIT_COLLECTION, read_audit_records
 from app.sources.capability_binding import builtin_capability_index
 from app.sources.migration import SourceCapabilityMigration
 from app.sources.models import SourceType
@@ -413,11 +414,50 @@ def test_bound_source_lifecycle_works_end_to_end_on_mongo(
     assert verified.capability_id == "cap-nginx"
     assert verified.source_instance_id == sid
 
-    # Lifecycle + token writes are auditable.
-    actions = {
-        d["action"] for d in db[SOURCE_AUDIT_COLLECTION].find(
-            {"source_instance_id": sid}
-        )
-    }
-    assert "source_register" in actions
-    assert "source_token_issue" in actions
+    disabled = svc.disable(identity=_admin(), source_instance_id=sid)
+    assert disabled.state == "disabled"
+    re_enabled = svc.enable(identity=_admin(), source_instance_id=sid)
+    assert re_enabled.state == "enabled"
+    retired = svc.retire(identity=_admin(), source_instance_id=sid)
+    assert retired.state == "retired"
+
+    # Lifecycle + token writes are auditable through the supported read path.
+    records = read_audit_records(
+        db[SOURCE_AUDIT_COLLECTION], sid, limit=50,
+    )
+    actions = [record["action"] for record in records]
+    assert actions.count("source_register") == 1
+    assert actions.count("source_token_issue") == 1
+    assert actions.count("source_enable") == 2
+    assert actions.count("source_disable") == 1
+    assert actions.count("source_retire") == 1
+
+    enable_rows = [
+        record for record in records if record["action"] == "source_enable"
+    ]
+    assert [row["after"]["state"] for row in enable_rows] == [
+        "enabled", "enabled",
+    ]
+    assert sorted(row["before"]["state"] for row in enable_rows) == [
+        "disabled", "validated",
+    ]
+    disable_row = next(
+        record for record in records
+        if record["action"] == "source_disable"
+    )
+    assert disable_row["before"]["state"] == "enabled"
+    assert disable_row["after"]["state"] == "disabled"
+    retire_row = next(
+        record for record in records
+        if record["action"] == "source_retire"
+    )
+    assert retire_row["before"]["state"] == "enabled"
+    assert retire_row["after"]["state"] == "retired"
+    for row in enable_rows + [disable_row, retire_row]:
+        assert row["actor"] == "admin"
+        assert row["capability_id"] == "cap-nginx"
+        assert row["source_instance_id"] == sid
+        assert "state" in row["changed_fields"]
+        serialized = json.dumps(row).lower()
+        assert "token" not in serialized
+        assert "secret" not in serialized

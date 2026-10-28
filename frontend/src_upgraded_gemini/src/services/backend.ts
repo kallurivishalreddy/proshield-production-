@@ -68,6 +68,7 @@ export interface RawDetection {
   reasoning: string;
   severity: string | null;
   source_instance_id: string | null;
+  capability_id: string | null;
   detected_at: string;
   extra: Record<string, unknown>;
 }
@@ -536,6 +537,15 @@ export const ops = {
         kind: string;
         incident_id: string | null;
         human_id: string | null;
+        event_id?: string | null;
+        classification?: string | null;
+        rule_id?: string | null;
+        detection_id?: string | null;
+        source_instance_id?: string | null;
+        capability_id?: string | null;
+        event_time?: string | null;
+        evidence_refs?: string[];
+        explanation?: string | null;
         title: string;
         detail: string | null;
         actor_subject_id: string | null;

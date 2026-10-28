@@ -71,7 +71,9 @@ def detection_engine() -> DetectionEngine:
 
 @pytest.fixture
 def detection_repository() -> MagicMock:
-    return MagicMock(spec=DetectionRepository)
+    repo = MagicMock(spec=DetectionRepository)
+    repo.find_by_event_id.return_value = []
+    return repo
 
 
 @pytest.fixture

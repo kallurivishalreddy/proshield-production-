@@ -303,6 +303,7 @@ def _build_ingress_pipeline(config, db, ingestion_service) -> Any:
     from app.pipeline import build_live_pipeline
     from app.incidents.repository import IncidentRepository
     from app.incidents.service import IncidentService
+    from app.notifications import NotificationRepository, NotificationService
     from app.persistence.rule_repository import RuleRepository
     from app.pipeline.managed_rule_sync import ManagedRuleLifecycleSync
     from app.rules import RuleRegistry, load_rules_from_specs
@@ -337,6 +338,9 @@ def _build_ingress_pipeline(config, db, ingestion_service) -> Any:
     except Exception as exc:  # pragma: no cover - best effort
         LOGGER.warning("managed rule lifecycle seed failed: %s", exc)
 
+    notification_service = NotificationService(
+        repository=NotificationRepository(db=db, config=config),
+    )
     return build_live_pipeline(
         config=config,
         db=db,
@@ -345,6 +349,10 @@ def _build_ingress_pipeline(config, db, ingestion_service) -> Any:
             repository=IncidentRepository(db=db, config=config),
         ),
         rule_repository=rule_repo,
+        # ADR-037: a valid event that matched no active rule is classified
+        # as unknown through the existing persisted analyst notification
+        # feed. No detection/correlation/case is fabricated.
+        unknown_event_sink=notification_service.emit_unknown_event,
     )
 
 

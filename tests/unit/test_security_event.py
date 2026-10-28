@@ -23,6 +23,7 @@ from app.domain.security_event import (
     validate_size_constraints,
 )
 from app.domain.uuid7 import uuid7
+from app.persistence.security_event_repository import canonical_content_equal
 
 
 def _make_event(**overrides) -> SecurityEvent:
@@ -325,4 +326,43 @@ def test_canonical_dict_contains_only_canonical_fields() -> None:
         "details",
         "schema_version",
     }
+
+
+def test_canonical_content_equal_can_exclude_event_id() -> None:
+    first = _make_event()
+    second = first.model_copy(update={"event_id": str(uuid7())})
+
+    assert not canonical_content_equal(first, second)
+    assert canonical_content_equal(first, second, ignore_event_id=True)
+
+
+def test_canonical_content_equal_uses_bson_time_precision() -> None:
+    first = _make_event(
+        event_time=datetime(2026, 1, 1, 0, 0, 0, 0, tzinfo=timezone.utc)
+    )
+    second = first.model_copy(
+        update={
+            "event_id": str(uuid7()),
+            "event_time": datetime(
+                2026, 1, 1, 0, 0, 0, 999, tzinfo=timezone.utc
+            ),
+            "ingested_at": datetime(
+                2026, 1, 2, tzinfo=timezone.utc
+            ),
+        }
+    )
+
+    assert canonical_content_equal(first, second, ignore_event_id=True)
+
+
+def test_canonical_content_equal_detects_material_change() -> None:
+    first = _make_event()
+    second = first.model_copy(
+        update={
+            "event_id": str(uuid7()),
+            "source_ip": "203.0.113.99",
+        }
+    )
+
+    assert not canonical_content_equal(first, second, ignore_event_id=True)
 

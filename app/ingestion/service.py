@@ -50,7 +50,10 @@ from ..domain.security_event import (
 )
 from ..domain.uuid7 import uuid7
 from ..observability.logging import get_request_id
-from ..persistence.security_event_repository import SecurityEventRepository
+from ..persistence.security_event_repository import (
+    SecurityEventRepository,
+    canonical_content_equal,
+)
 
 
 _log = logging.getLogger(__name__)
@@ -79,6 +82,48 @@ class SecurityEventIngestionService:
         """
         self._validate(event)
         stamped = self._stamp(event)
+
+        # Boundary 2 source-marker identity: a repeated
+        # (source, collector, source_event_id) is a re-delivery even when
+        # the caller supplied a new canonical event_id.  Let the repository
+        # create() path handle the same-event_id case so H-04's documented
+        # event_id conflict message is preserved.
+        existing = self._repository.find_by_canonical_identity(
+            source=stamped.source,
+            source_event_id=stamped.provenance.source_event_id,
+            collector=stamped.provenance.collector,
+        )
+        if existing is not None and existing.event_id != stamped.event_id:
+            if canonical_content_equal(existing, stamped, ignore_event_id=True):
+                _log.info(
+                    "ingest.source_identity_replay",
+                    extra={
+                        "event_id": existing.event_id,
+                        "incoming_event_id": stamped.event_id,
+                        "source_event_id": stamped.provenance.source_event_id,
+                        "request_id": get_request_id(),
+                    },
+                )
+                return existing
+            _log.warning(
+                "ingest.source_identity_conflict",
+                extra={
+                    "event_id": existing.event_id,
+                    "incoming_event_id": stamped.event_id,
+                    "source_event_id": stamped.provenance.source_event_id,
+                    "request_id": get_request_id(),
+                },
+            )
+            raise ConflictEventError(
+                safe_message=(
+                    "source identity already exists with different content"
+                ),
+                internal_detail=(
+                    "source_event_id="
+                    f"{stamped.provenance.source_event_id}"
+                ),
+            )
+
         try:
             persisted = self._repository.create(stamped)
         except DuplicateEventError as exc:

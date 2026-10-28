@@ -421,11 +421,12 @@ export const SocProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const rawNotifs = notifRes?.notifications || [];
       setNotifications(rawNotifs.map(n => ({
         id: n.notification_id,
-        title: n.human_id ? `${n.kind} — ${n.human_id}` : n.kind,
+        title: n.title || (n.human_id ? `${n.kind} — ${n.human_id}` : n.kind),
         description: n.detail || n.title || '',
         timestamp: n.created_at,
         read: n.read,
-        severity: (
+        // ADR-037 unknown activity is not assigned a threat severity.
+        severity: n.kind === 'event.unknown' ? null : (
           n.kind.includes('failed') ? 'HIGH' :
           n.kind.includes('closed') ? 'MEDIUM' :
           n.kind.includes('created') ? 'CRITICAL' : 'MEDIUM'

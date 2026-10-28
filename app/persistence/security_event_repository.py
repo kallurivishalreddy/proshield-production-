@@ -417,6 +417,28 @@ def _ms_precision(value: Any) -> Any:
     return value
 
 
+def canonical_content_equal(
+    a: SecurityEvent,
+    b: SecurityEvent,
+    *,
+    ignore_event_id: bool = False,
+) -> bool:
+    """Compare two events using the documented canonical normalization.
+
+    The repository's ``_canonical_equal`` is the single comparison
+    implementation: it excludes the server-stamped ``ingested_at`` and
+    compares ``event_time`` at BSON millisecond precision.  Source-marker
+    identity deliberately spans a new canonical event_id, so callers may
+    exclude only that field while retaining every other content check.
+    """
+    a_payload = to_canonical_dict(a)
+    b_payload = to_canonical_dict(b)
+    if ignore_event_id:
+        a_payload.pop("event_id", None)
+        b_payload.pop("event_id", None)
+    return _canonical_equal(a_payload, b_payload)
+
+
 def _canonical_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     """Equality check on the canonical dict form of an event.
 

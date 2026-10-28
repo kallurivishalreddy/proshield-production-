@@ -20,6 +20,7 @@ from app.domain.security_event import (
     SecurityEvent,
     SecurityEventProvenance,
 )
+from app.domain.uuid7 import uuid7
 from app.ingestion.service import SecurityEventIngestionService
 from app.persistence.security_event_repository import (
     SecurityEventRepository,
@@ -131,3 +132,109 @@ def test_ingest_generates_event_id_when_missing(
     assert parsed.version == 7
     # And persisted.
     assert repository.get_by_event_id(out.event_id) is not None
+
+
+# ---------------------------------------------------------------- H-05
+def _source_marker_event(
+    marker: str,
+    *,
+    event_id: str | None = None,
+    collector: str = "simulated",
+    **overrides,
+) -> SecurityEvent:
+    base = _make_event(
+        event_id=event_id or str(uuid7()),
+        **overrides,
+    )
+    return base.model_copy(
+        update={
+            "provenance": SecurityEventProvenance(
+                collector=collector,
+                source_event_id=marker,
+            )
+        }
+    )
+
+
+def test_source_marker_identical_content_reuses_existing_event(
+    service: SecurityEventIngestionService,
+    repository: SecurityEventRepository,
+) -> None:
+    marker = "h05-identical-marker"
+    first = _source_marker_event(marker)
+    duplicate = first.model_copy(update={"event_id": str(uuid7())})
+
+    persisted_first = service.ingest(first)
+    persisted_duplicate = service.ingest(duplicate)
+
+    assert persisted_duplicate.event_id == persisted_first.event_id
+    assert repository.count() == 1
+    assert repository.get_by_event_id(duplicate.event_id) is None
+
+
+def test_source_marker_conflicting_content_raises_conflict(
+    service: SecurityEventIngestionService,
+    repository: SecurityEventRepository,
+) -> None:
+    marker = "h05-conflict-marker"
+    first = _source_marker_event(marker)
+    conflicting = first.model_copy(
+        update={
+            "event_id": str(uuid7()),
+            "source_ip": "203.0.113.99",
+        }
+    )
+
+    service.ingest(first)
+    with pytest.raises(ConflictEventError) as exc:
+        service.ingest(conflicting)
+    assert exc.value.code == "conflict_event"
+    assert repository.count() == 1
+    assert repository.get_by_event_id(conflicting.event_id) is None
+    original = repository.get_by_event_id(first.event_id)
+    assert original is not None
+    assert original.source_ip == "203.0.113.10"
+
+
+def test_source_marker_identity_includes_collector(
+    service: SecurityEventIngestionService,
+    repository: SecurityEventRepository,
+) -> None:
+    marker = "h05-collector-marker"
+    first = _source_marker_event(marker, collector="simulated")
+    other_collector = _source_marker_event(marker, collector="nginx")
+
+    service.ingest(first)
+    persisted = service.ingest(other_collector)
+
+    assert persisted.event_id == other_collector.event_id
+    assert repository.count() == 2
+
+
+def test_distinct_source_markers_remain_distinct(
+    service: SecurityEventIngestionService,
+    repository: SecurityEventRepository,
+) -> None:
+    first = _source_marker_event("h05-marker-a")
+    second = _source_marker_event("h05-marker-b")
+
+    service.ingest(first)
+    persisted = service.ingest(second)
+
+    assert persisted.event_id == second.event_id
+    assert repository.count() == 2
+
+
+def test_same_event_id_conflict_still_uses_event_id_contract(
+    service: SecurityEventIngestionService,
+    repository: SecurityEventRepository,
+) -> None:
+    first = _source_marker_event("h05-event-id-conflict")
+    changed = first.model_copy(update={"source_ip": "203.0.113.98"})
+
+    service.ingest(first)
+    with pytest.raises(ConflictEventError) as exc:
+        service.ingest(changed)
+    assert exc.value.code == "conflict_event"
+    assert "event_id already exists" in exc.value.safe_message
+    assert repository.count() == 1

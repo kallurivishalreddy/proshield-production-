@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ..detection.engine import DetectionEngine
 from ..detection.models import Detection, DetectionResult
@@ -164,23 +164,48 @@ class DetectionPipeline:
             persisted_event = event
         else:
             persisted_event = self._ingestion.ingest(event)
-        # Default ``now`` to the event's observed
-        # ``event_time`` (the source's timestamp) so
-        # the detection's ``detected_at`` and
-        # therefore the ``detection_id`` are content-
-        # derived and stable across replays. The
-        # caller may still override by passing
-        # ``now=`` explicitly. This is the DEDUP-01
-        # cascading fix: a stable event_id alone is
-        # not enough; the detection_id must also be
-        # stable on replay for the persistence layer
-        # to dedup correctly.
+        # When no processing instant is supplied, use the event's
+        # observed ``event_time`` so direct callers are reproducible.
+        # The live pipeline supplies a wall-clock instant instead, so
+        # ``detected_at`` remains the distinct detection-processing time.
+        # Replay safety is provided by the logical-identity reuse below
+        # (DEDUP-03), not by requiring detected_at to be event_time.
         if now is None:
             now = persisted_event.event_time
         detection_result = self._engine.run(persisted_event, now=now)
+
+        # DEDUP-03: a detection's identity for one event is its
+        # (rule_id, rule_version) pair.  ``detected_at`` is the
+        # processing instant and may differ on a retry, so the
+        # deterministic detection_id alone cannot deduplicate an exact
+        # event replay in the live path.  Reuse the already-persisted
+        # detection rather than minting a second one.
+        existing_by_rule: Dict[Tuple[str, int], Detection] = {}
+        for existing in self._repo.find_by_event_id(
+            persisted_event.event_id
+        ):
+            existing_by_rule.setdefault(
+                (existing.rule_id, existing.rule_version), existing
+            )
+
         persisted: List[Detection] = []
         failures: List[DetectionPersistFailure] = []
         for detection in detection_result.detections:
+            existing = existing_by_rule.get(
+                (detection.rule_id, detection.rule_version)
+            )
+            if existing is not None:
+                _log.info(
+                    "detection.replay_reused",
+                    extra={
+                        "event_id": persisted_event.event_id,
+                        "rule_id": detection.rule_id,
+                        "rule_version": detection.rule_version,
+                        "detection_id": existing.detection_id,
+                    },
+                )
+                persisted.append(existing)
+                continue
             # Capability patch gap 5: compose the documented per-detection
             # severity band (SeverityEngine) and carry the ingesting
             # source's provenance pointer onto the detection BEFORE

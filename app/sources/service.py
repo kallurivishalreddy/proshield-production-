@@ -672,6 +672,7 @@ class SourceManagementService:
                     f"target_state={SourceState.ENABLED.value}"
                 ),
             )
+        before = snapshot_source(current)
         now = _utcnow()
         updated = current.model_copy(update={
             "state": SourceState.ENABLED,
@@ -680,6 +681,16 @@ class SourceManagementService:
         })
         persisted = self._repository.upsert(updated)
         self._registry.replace(persisted)
+        self._audit(
+            action="source_enable",
+            source=persisted,
+            before=before,
+            reason=(
+                f"lifecycle transition {current.state.value} -> "
+                f"{SourceState.ENABLED.value}"
+            ),
+            actor=identity.subject_id,
+        )
         return persisted.to_view()
 
     def disable(
@@ -703,6 +714,7 @@ class SourceManagementService:
                     f"target_state={SourceState.DISABLED.value}"
                 ),
             )
+        before = snapshot_source(current)
         now = _utcnow()
         updated = current.model_copy(update={
             "state": SourceState.DISABLED,
@@ -711,6 +723,16 @@ class SourceManagementService:
         })
         persisted = self._repository.upsert(updated)
         self._registry.replace(persisted)
+        self._audit(
+            action="source_disable",
+            source=persisted,
+            before=before,
+            reason=(
+                f"lifecycle transition {current.state.value} -> "
+                f"{SourceState.DISABLED.value}"
+            ),
+            actor=identity.subject_id,
+        )
         return persisted.to_view()
 
     def retire(
@@ -736,6 +758,7 @@ class SourceManagementService:
                     f"target_state={SourceState.RETIRED.value}"
                 ),
             )
+        before = snapshot_source(current)
         now = _utcnow()
         updated = current.model_copy(update={
             "state": SourceState.RETIRED,
@@ -745,6 +768,16 @@ class SourceManagementService:
         })
         persisted = self._repository.upsert(updated)
         self._registry.replace(persisted)
+        self._audit(
+            action="source_retire",
+            source=persisted,
+            before=before,
+            reason=(
+                f"lifecycle transition {current.state.value} -> "
+                f"{SourceState.RETIRED.value}"
+            ),
+            actor=identity.subject_id,
+        )
         return persisted.to_view()
 
     def update_metadata(

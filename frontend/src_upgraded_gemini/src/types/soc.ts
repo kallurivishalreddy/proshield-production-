@@ -60,8 +60,10 @@ export interface Detection {
   title: string;
   ruleId: string; // RULE-01
   ruleName: string;
-  sourceId: string; // '' — backend detections do not carry source attribution
-  sourceName: string; // ''
+  eventId: string; // canonical SecurityEvent.event_id
+  capabilityId: string; // server-derived provenance.capability_id
+  sourceId: string; // source_instance_id
+  sourceName: string; // source_instance_id
   /** Backend detections carry no severity — always null today. */
   severity: Severity | null;
   timestamp: string;
@@ -283,7 +285,8 @@ export interface SocNotification {
   description: string;
   timestamp: string;
   read: boolean;
-  severity: Severity;
+  /** null = no severity is claimed (e.g. ADR-037 unknown activity). */
+  severity: Severity | null;
   linkPage: string;
   targetId?: string;
 }

@@ -11,6 +11,7 @@ import { useSoc } from '../../context/SocContext';
 import { Severity } from '../../types/soc';
 import { SeverityBadge } from '../common/SeverityBadge';
 import { HumanIdTag } from '../common/HumanIdTag';
+import { filterDetections } from '../../utils/detectionFilters';
 import { formatIstTimestamp } from '../../utils/format';
 
 export const DetectionsPage: React.FC = () => {
@@ -26,21 +27,12 @@ export const DetectionsPage: React.FC = () => {
 
   const sourcesList = Array.from(new Set(detections.map(d => d.sourceId)));
 
-  const filteredDetections = detections.filter(d => {
-    const q = searchQuery.toLowerCase().trim();
-    const matchesSearch =
-      !q ||
-      d.humanId.toLowerCase().includes(q) ||
-      d.title.toLowerCase().includes(q) ||
-      d.ruleName.toLowerCase().includes(q) ||
-      d.evidenceSummary.toLowerCase().includes(q) ||
-      (d.attackerIp && d.attackerIp.toLowerCase().includes(q));
-
-    const matchesSeverity = severityFilter === 'ALL' || d.severity === severityFilter;
-    const matchesSource = sourceFilter === 'ALL' || d.sourceId === sourceFilter;
-
-    return matchesSearch && matchesSeverity && matchesSource;
+  const filteredDetections = filterDetections(detections, {
+    query: searchQuery,
+    severity: severityFilter,
+    sourceId: sourceFilter
   });
+  const hasActiveQuery = searchQuery.trim().length > 0;
 
   return (
     <div className="space-y-4 pb-12 animate-in fade-in duration-200">
@@ -54,6 +46,11 @@ export const DetectionsPage: React.FC = () => {
             <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-200 border border-slate-700">
               {filteredDetections.length} shown
             </span>
+            {hasActiveQuery && (
+              <span className="text-[10px] font-mono text-slate-500">
+                of {detections.length} loaded total
+              </span>
+            )}
           </div>
           <p className="text-xs text-slate-400 mt-1">
             Source event → detection → correlation → case. Select a detection to inspect its rule and evidence.
@@ -69,7 +66,7 @@ export const DetectionsPage: React.FC = () => {
             type="text"
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
-            placeholder="Search detections by ID, rule name, IP, evidence string..."
+            placeholder="Search by detection ID, event ID, capability, rule, source, IP..."
             className="w-full pl-9 pr-8 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-amber-500 font-mono"
           />
           {searchQuery && (
@@ -160,6 +157,22 @@ export const DetectionsPage: React.FC = () => {
                     <span className="text-amber-400 font-semibold">{field.field}:</span> {field.value}
                   </span>
                 ))}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono text-slate-400">
+                <div className="min-w-0">
+                  <span>Event:</span>{' '}
+                  <span className="text-slate-200 break-all">
+                    {det.eventId || 'not available'}
+                  </span>
+                </div>
+                <span>•</span>
+                <div>
+                  <span>Capability:</span>{' '}
+                  <span className="text-slate-200">
+                    {det.capabilityId || 'not available'}
+                  </span>
+                </div>
               </div>
 
               {/* Pivot Navigation Links & Actions */}

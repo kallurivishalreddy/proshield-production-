@@ -227,7 +227,7 @@ def _auth_fail_event(i, *, source_ip, endpoint, when):
 
     return {
         "event_id": str(_uuid7()),
-        "source_event_id": f"v2-{RUN_ID}-{i}",
+        "source_event_id": f"v2-{RUN_ID}-{i}-{uuid.uuid4().hex[:8]}",
         "event_type": "authentication_failure",
         "event_time": when.isoformat().replace("+00:00", "Z"),
         "source_ip": source_ip,
@@ -613,6 +613,265 @@ class TestV2P0UnmatchedVisibility:
             "V2-06 regression: valid unmatched event invisible to the "
             "analyst"
         )
+
+
+# ------------------------------------------------------------- ADR-037
+class TestV2P0UnknownActivity:
+    def test_no_rule_event_creates_persisted_unknown_notification(
+        self, config, v2_mongo, proxy_client, ingress_client, ingress_bundle,
+    ):
+        """ADR-037: a valid no-rule event is classified as unknown in the
+        persisted analyst feed, with no fabricated rule/detection."""
+        from app.domain.uuid7 import uuid7 as _uuid7
+
+        admin = _admin(proxy_client)
+        sid = _register_source(
+            proxy_client, admin, "v2-unknown-activity-01", "/health-probe"
+        )
+        eid = str(_uuid7())
+        data = _ingest(
+            proxy_client, ingress_client, admin, sid,
+            [{
+                "event_id": eid,
+                "source_event_id": f"v2-unknown-activity-{RUN_ID}",
+                "event_type": "tls_anomaly",
+                "event_time": datetime.now(timezone.utc)
+                .isoformat().replace("+00:00", "Z"),
+                "source_ip": "203.0.113.208",
+                "endpoint": "/health-probe",
+                "asset": "web-app",
+                "details": {"handshake_failure": True},
+            }],
+        )
+        assert data["accepted_event_ids"] == [eid]
+        db = v2_mongo[config.mongo_db]
+
+        doc = db["notifications"].find_one(
+            {"kind": "event.unknown", "event_id": eid}
+        )
+        assert doc is not None, "ADR-037 unknown notification was not persisted"
+        assert doc["classification"] == "unknown"
+        assert doc["rule_id"] == ""
+        assert doc["detection_id"] == ""
+        assert doc["evidence_refs"] == [eid]
+        assert doc["source_instance_id"] == sid
+        assert doc["capability_id"] == "cap-nginx"
+        assert doc["incident_id"] == ""
+        assert "matched no active rule" in doc["detail"]
+        persisted_event = db["security_events"].find_one({"event_id": eid})
+        assert persisted_event is not None
+        assert doc["event_time"] == persisted_event["event_time"]
+
+        r = proxy_client.post(
+            "/api/proxy",
+            json={"operation": "notification.list", "limit": 200},
+            headers={"X-ProShield-Session": admin},
+        )
+        assert r.status_code == 200, r.text
+        items = r.json()["data"]["notifications"]
+        row = next(item for item in items if item["notification_id"] == doc["notification_id"])
+        assert row["kind"] == "event.unknown"
+        assert row["classification"] == "unknown"
+        assert row["event_id"] == eid
+        assert row["rule_id"] is None
+        assert row["detection_id"] is None
+        assert row["source_instance_id"] == sid
+        assert row["capability_id"] == "cap-nginx"
+        assert row["event_time"] == (
+            persisted_event["event_time"]
+            .replace(tzinfo=timezone.utc)
+            .isoformat()
+        )
+        assert row["evidence_refs"] == [eid]
+
+        assert db["detections"].count_documents({"event_id": eid}) == 0
+        assert db["correlations"].count_documents({"event_ids": eid}) == 0
+        assert db["incidents"].count_documents({"evidence.event_ids": eid}) == 0
+
+        # Replaying the persisted event must reuse the same alert.
+        event = ingress_bundle.pipeline.event_repository.get_by_event_id(eid)
+        assert event is not None
+        ingress_bundle.pipeline.process(event, event_persisted=True)
+        assert db["notifications"].count_documents(
+            {"kind": "event.unknown", "event_id": eid}
+        ) == 1
+
+    def test_matched_event_does_not_create_unknown_notification(
+        self, config, v2_mongo, proxy_client, ingress_client,
+    ):
+        """Known-rule positive control: matched events are not unknown."""
+        from app.domain.uuid7 import uuid7 as _uuid7
+
+        admin = _admin(proxy_client)
+        sid = _register_source(
+            proxy_client, admin, "v2-known-control-01", "/api/login"
+        )
+        eid = str(_uuid7())
+        _ingest(
+            proxy_client, ingress_client, admin, sid,
+            [{
+                "event_id": eid,
+                "source_event_id": f"v2-known-control-{RUN_ID}",
+                "event_type": "authentication_failure",
+                "event_time": datetime.now(timezone.utc)
+                .isoformat().replace("+00:00", "Z"),
+                "source_ip": "203.0.113.209",
+                "endpoint": "/api/login",
+                "asset": "web-app",
+                "details": {"http_method": "POST", "status_code": 401},
+            }],
+        )
+        db = v2_mongo[config.mongo_db]
+        assert db["detections"].count_documents({"event_id": eid}) > 0
+        assert db["notifications"].count_documents(
+            {"kind": "event.unknown", "event_id": eid}
+        ) == 0
+
+
+class TestV2P0ReplayIdempotency:
+    def test_exact_replay_keeps_two_detections_and_same_ids(
+        self, config, v2_mongo, proxy_client, ingress_client,
+    ):
+        """H-03: an exact event replay is a no-op for detections.
+
+        The live ingress passes a new processing instant on the replay;
+        the logical (event, rule, rule version) identity must still
+        reuse the original two detections and expose the same IDs via
+        ``detection.list``.
+        """
+        import time
+
+        admin = _admin(proxy_client)
+        sid = _register_source(
+            proxy_client, admin, "v2-replay-idempotency-01", "/api/login"
+        )
+        event = _auth_fail_event(
+            1,
+            source_ip="203.0.113.210",
+            endpoint="/api/login",
+            when=datetime.now(timezone.utc),
+        )
+        eid = event["event_id"]
+        db = v2_mongo[config.mongo_db]
+
+        first = _ingest(proxy_client, ingress_client, admin, sid, [event])
+        assert first["accepted_event_ids"] == [eid]
+        first_rows = list(
+            db["detections"].find({"event_id": eid}, {"_id": 0})
+        )
+        first_ids = sorted(row["detection_id"] for row in first_rows)
+        assert len(first_ids) == 2
+
+        time.sleep(0.02)
+        replay = _ingest(
+            proxy_client, ingress_client, admin, sid, [dict(event)]
+        )
+        assert replay["accepted_event_ids"] == [eid]
+        replay_rows = list(
+            db["detections"].find({"event_id": eid}, {"_id": 0})
+        )
+        replay_ids = sorted(row["detection_id"] for row in replay_rows)
+        assert replay_ids == first_ids
+        assert len(replay_ids) == 2
+        assert db["security_events"].count_documents({"event_id": eid}) == 1
+        assert db["notifications"].count_documents(
+            {"kind": "event.unknown", "event_id": eid}
+        ) == 0
+
+        r = proxy_client.post(
+            "/api/proxy",
+            json={
+                "operation": "detection.list",
+                "event_id": eid,
+                "limit": 200,
+            },
+            headers={"X-ProShield-Session": admin},
+        )
+        assert r.status_code == 200, r.text
+        rows = r.json()["data"]["detections"]
+        assert sorted(row["detection_id"] for row in rows) == first_ids
+        assert all(row["event_id"] == eid for row in rows)
+
+
+class TestV2P0SourceMarkerDedup:
+    def test_duplicate_conflict_and_distinct_markers_via_ingress(
+        self, config, v2_mongo, proxy_client, ingress_client,
+    ):
+        """H-05: source identity is (source, collector, source_event_id).
+
+        A new canonical event_id does not make a repeated source record
+        distinct.  Identical content is a duplicate; changed content is a
+        conflict; a different source marker remains a new event.
+        """
+        from app.domain.uuid7 import uuid7 as _uuid7
+
+        admin = _admin(proxy_client)
+        sid = _register_source(
+            proxy_client, admin, "v2-h05-source-marker-01", "/api/login"
+        )
+        marker = f"v2-h05-marker-{RUN_ID}"
+        event_a = _auth_fail_event(
+            1,
+            source_ip="203.0.113.210",
+            endpoint="/api/login",
+            when=datetime.now(timezone.utc),
+        )
+        event_a["source_event_id"] = marker
+        a_id = event_a["event_id"]
+        db = v2_mongo[config.mongo_db]
+
+        first = _ingest(proxy_client, ingress_client, admin, sid, [event_a])
+        assert first["accepted_event_ids"] == [a_id]
+        assert db["security_events"].count_documents(
+            {"event_id": a_id}
+        ) == 1
+        assert db["detections"].count_documents({"event_id": a_id}) == 2
+
+        duplicate = dict(event_a)
+        duplicate["event_id"] = str(_uuid7())
+        b_id = duplicate["event_id"]
+        replay = _ingest(
+            proxy_client, ingress_client, admin, sid, [duplicate]
+        )
+        assert replay["accepted_event_ids"] == [a_id]
+        assert replay["rejected"] == []
+        assert db["security_events"].count_documents(
+            {"provenance.source_event_id": marker}
+        ) == 1
+        assert db["security_events"].count_documents({"event_id": b_id}) == 0
+        assert db["detections"].count_documents({"event_id": b_id}) == 0
+        assert db["detections"].count_documents({"event_id": a_id}) == 2
+
+        conflicting = dict(event_a)
+        conflicting["event_id"] = str(_uuid7())
+        conflicting["source_ip"] = "203.0.113.212"
+        c_id = conflicting["event_id"]
+        conflict = _ingest(
+            proxy_client, ingress_client, admin, sid, [conflicting]
+        )
+        assert conflict["accepted_event_ids"] == []
+        assert conflict["rejected"][0]["reason"] == "conflict_event"
+        assert db["security_events"].count_documents({"event_id": c_id}) == 0
+        assert db["security_events"].count_documents({"event_id": a_id}) == 1
+
+        distinct = dict(event_a)
+        distinct["event_id"] = str(_uuid7())
+        distinct["source_event_id"] = f"{marker}-distinct"
+        d_id = distinct["event_id"]
+        accepted = _ingest(
+            proxy_client, ingress_client, admin, sid, [distinct]
+        )
+        assert accepted["accepted_event_ids"] == [d_id]
+        assert db["security_events"].count_documents({"event_id": d_id}) == 1
+        assert db["security_events"].count_documents(
+            {"provenance.source_event_id": marker}
+        ) == 1
+        assert db["security_events"].count_documents(
+            {"provenance.source_event_id": f"{marker}-distinct"}
+        ) == 1
+        assert db["notifications"].count_documents(
+            {"kind": "event.unknown", "event_id": a_id}
+        ) == 0
 
 
 # ------------------------------------------------------------- V2-19 / AUD-CL-02
